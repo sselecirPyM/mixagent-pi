@@ -1,0 +1,38 @@
+{
+  "name": "pi-mixagent",
+  "version": "0.1.0",
+  "description": "pi extension: cheap scout model (Haiku) explores code, flagship planner (Opus) writes a Markdown change plan, cheap executor (Haiku) applies it in a new session.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:e2e": "node test/e2e/run.mjs"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.73.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "mixagent.example.json"
+  ]
+}
