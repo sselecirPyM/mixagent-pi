@@ -142,8 +142,9 @@ pi -e /path/to/mixagent/src/index.ts
    ```
 2. **运行时命令**（只对当前 pi 进程生效，用 `/mix save` 持久化）
    ```
+   /mix model                    # 列出可用模型，并标出各角色当前使用的模型
    /mix model planner anthropic/claude-opus-4-7
-   /mix model scout              # 不写模型时，弹出可用模型列表选择
+   /mix model scout              # 不写模型时，弹出可用模型列表选择（显示供应商/模型 ID 和模型名）
    /mix thinking planner high
    /mix save                     # 写入 ~/.pi/agent/mixagent.json
    /mix save project             # 写入 <项目>/.pi/mixagent.json
@@ -181,6 +182,7 @@ pi -e /path/to/mixagent/src/index.ts
 | --- | --- |
 | `/mix` 或 `/mix status` | 查看当前状态和模型 |
 | `/mix on` / `/mix off` | 开启或关闭。关闭后恢复原来的模型和工具，变回普通 pi |
+| `/mix model` | 列出可用模型（已配置 API key 的），并标出各角色当前使用的模型 |
 | `/mix model <scout\|planner\|executor> [provider/id]` | 切换某个角色的模型 |
 | `/mix thinking <role> <level>` | 设置某个角色的思考等级 |
 | `/mix save [global\|project]` | 把运行时修改写进配置文件 |

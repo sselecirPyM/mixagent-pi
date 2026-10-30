@@ -156,6 +156,11 @@ function modelSpec(model: Model<Api> | undefined): string {
 	return model ? `${model.provider}/${model.id}` : "(none)";
 }
 
+/** provider/id plus the display name, e.g. "anthropic/claude-opus-4-7 · Claude Opus 4.7". */
+function modelLabel(model: Model<Api>): string {
+	return model.name && model.name !== model.id ? `${modelSpec(model)} · ${model.name}` : modelSpec(model);
+}
+
 function shortName(spec: string): string {
 	return spec.slice(spec.indexOf("/") + 1);
 }
@@ -266,6 +271,8 @@ export default function mixagent(pi: ExtensionAPI) {
 	let baseTools: string[] | undefined;
 	/** The user's model before MixAgent switched to the scout; restored on /mix off. */
 	let savedModel: Model<Api> | undefined;
+	/** Kept from session_start: argument completions get no ctx but list models for /mix model <role>. */
+	let modelRegistry: ExtensionContext["modelRegistry"] | undefined;
 
 	pi.registerFlag("mix-scout", { description: "MixAgent scout model (provider/id)", type: "string" });
 	pi.registerFlag("mix-planner", { description: "MixAgent planner model (provider/id)", type: "string" });
@@ -349,6 +356,7 @@ export default function mixagent(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		config = effectiveConfig(ctx.cwd);
+		modelRegistry = ctx.modelRegistry;
 		// handoff and discard are only meaningful during scout runs.
 		const active = pi.getActiveTools();
 		if (active.some((t) => SCOUT_ONLY_TOOLS.includes(t))) {
@@ -962,9 +970,21 @@ export default function mixagent(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("mix", {
-		description: "MixAgent: /mix [on|off|status|model <role> [provider/id]|thinking <role> <level>|save [global|project]]",
+		description: "MixAgent: /mix [on|off|status|model [<role> [provider/id]]|thinking <role> <level>|save [global|project]]",
 		getArgumentCompletions: (prefix) => {
 			const parts = prefix.split(/\s+/);
+			if (parts.length === 3 && parts[0] === "model" && ROLES.includes(parts[1] as Role)) {
+				const role = parts[1] as Role;
+				const query = parts[2].toLowerCase();
+				const items = (modelRegistry?.getAvailable() ?? [])
+					.filter((m) => modelSpec(m).toLowerCase().includes(query) || m.name.toLowerCase().includes(query))
+					.map((m) => ({
+						value: `model ${role} ${modelSpec(m)}`,
+						label: modelSpec(m),
+						description: config?.[roleKey(role)] === modelSpec(m) ? `${m.name} (current)` : m.name,
+					}));
+				return items.length > 0 ? items : null;
+			}
 			const options =
 				parts.length <= 1
 					? ["on", "off", "status", "model", "thinking", "save"]
@@ -999,14 +1019,32 @@ export default function mixagent(pi: ExtensionAPI) {
 					break;
 				case "model": {
 					const role = rest[0] as Role;
+					if (!role) {
+						const models = ctx.modelRegistry.getAvailable();
+						if (models.length === 0) {
+							ctx.ui.notify("No models with configured auth. Check /model or ~/.pi/agent/models.json", "error");
+							return;
+						}
+						const lines = models.map((m) => {
+							const roles = ROLES.filter((r) => config![roleKey(r)] === modelSpec(m));
+							return `  ${modelLabel(m)}${roles.length > 0 ? `  ← ${roles.join(", ")}` : ""}`;
+						});
+						ctx.ui.notify(
+							[`Available models (${models.length}):`, ...lines, "Set one with /mix model <scout|planner|executor> <provider/modelId>"].join("\n"),
+							"info",
+						);
+						return;
+					}
 					if (!ROLES.includes(role)) {
 						ctx.ui.notify("Usage: /mix model <scout|planner|executor> [provider/modelId]", "error");
 						return;
 					}
 					let spec: string | undefined = rest[1];
 					if (!spec && ctx.hasUI) {
-						const choices = ctx.modelRegistry.getAvailable().map((m) => modelSpec(m));
-						spec = await ctx.ui.select(`MixAgent ${role} model`, choices);
+						const models = ctx.modelRegistry.getAvailable();
+						const label = await ctx.ui.select(`MixAgent ${role} model`, models.map(modelLabel));
+						const chosen = models.find((m) => modelLabel(m) === label);
+						spec = chosen && modelSpec(chosen);
 					}
 					if (!spec) return;
 					const parsed = parseModelSpec(spec);

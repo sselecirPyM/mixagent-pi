@@ -118,6 +118,11 @@ await send("/mix off", notify(/MixAgent disabled/));
 const callsBeforeOff = readFileSync(log, "utf8").trim().split("\n").length;
 await send("Third request (mix off)");
 const status = await send("/mix status", notify(/MixAgent: off/));
+const modelList = await send("/mix model", notify(/Available models/));
+const select = await send("/mix model planner", (e) => e.type === "extension_ui_request" && e.method === "select");
+const picked = new Promise((resolve) => waiters.push({ match: notify(/MixAgent planner model/), resolve }));
+rpc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: select.id, value: select.options.find((o) => o.startsWith("mock/planner")) })}\n`);
+const pickedNotice = await picked;
 rpc.kill();
 
 const allRpcCalls = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
@@ -126,6 +131,11 @@ const offCalls = allRpcCalls.slice(callsBeforeOff);
 assert.ok(offCalls.length > 0 && offCalls.every((c) => !c.scoutPrompt && !c.tools.includes("handoff")), "/mix off restores normal pi");
 assert.ok(!offCalls.some((c) => c.model === "planner"), "no planner call when mix is off");
 console.log(`/mix off OK; status: ${JSON.stringify(status.message)}`);
+assert.match(modelList.message, /mock\/planner · Mock planner {2}← planner/, "/mix model lists models and marks role assignments");
+console.log(`/mix model OK: ${JSON.stringify(modelList.message)}`);
+assert.ok(select.options.includes("mock/planner · Mock planner"), "/mix model <role> picker shows provider/id and name");
+assert.match(pickedNotice.message, /MixAgent planner model: mock\/planner /, "picked label maps back to provider/id");
+console.log(`/mix model planner OK: ${JSON.stringify(select.options)}`);
 const scouts = rpcCalls.filter((c) => c.model === "scout");
 assert.equal(scouts.length, 4, "two scout calls per cycle");
 // Cycle 2 first call: [user, assistant(handoff), toolResult(handoff), user] — exploration of cycle 1 pruned.
