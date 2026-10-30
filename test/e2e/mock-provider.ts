@@ -82,7 +82,10 @@ function lastText(ctx: Context): string {
 		: last.content.map((c) => (c.type === "text" ? c.text : "")).join("");
 }
 
-type Reply = { text?: string; toolCall?: { name: string; arguments: Record<string, any> } };
+type Reply = { text?: string; toolCall?: { name: string; arguments: Record<string, any> }; error?: string };
+
+/** "flaky" prompts: sub-planner S2 answers empty once (counted here), task executor T2 fails until it is retried. */
+const flakyCalls = new Map<string, number>();
 
 function script(model: Model<any>, ctx: Context): Reply {
 	const last = ctx.messages[ctx.messages.length - 1];
@@ -121,12 +124,20 @@ function script(model: Model<any>, ctx: Context): Reply {
 			const text = lastText(ctx);
 			if (text.includes("# Join instructions")) return { text: FORK_PLAN };
 			const sub = text.match(/# Sub-planner instructions: subtask (S\d)/)?.[1];
+			if (sub && sub === "S2" && text.includes("flaky")) {
+				const n = (flakyCalls.get(sub) ?? 0) + 1;
+				flakyCalls.set(sub, n);
+				if (n === 1) return { text: "" };
+			}
 			if (sub) return { text: subPlan(sub) };
 			return { text: text.includes("fork:") ? LEAD_SPLIT : PLAN };
 		}
 		case "executor": {
 			if (last?.role === "user") {
 				const task = lastText(ctx).match(/## Task (T\d)/)?.[1];
+				if (task === "T2" && lastText(ctx).includes("flaky") && !lastText(ctx).includes("a previous attempt at this task failed")) {
+					return { error: "mock executor failure" };
+				}
 				if (task) return { toolCall: { name: "write", arguments: { path: `src/${task}.txt`, content: task } } };
 				if (lastText(ctx).includes("## Already applied")) return { toolCall: { name: "bash", arguments: { command: "echo joined" } } };
 				return {
@@ -199,11 +210,17 @@ export default function (pi: ExtensionAPI) {
 					totalTokens: 120,
 					cost: { input: 0.0001, output: 0.0001, cacheRead: 0, cacheWrite: 0, total: 0.0002 },
 				},
-				stopReason: reply.toolCall ? "toolUse" : "stop",
+				stopReason: reply.error ? "error" : reply.toolCall ? "toolUse" : "stop",
+				errorMessage: reply.error,
 				timestamp: Date.now(),
 			};
 			queueMicrotask(() => {
 				stream.push({ type: "start", partial: output });
+				if (reply.error) {
+					stream.push({ type: "error", reason: "error", error: output });
+					stream.end();
+					return;
+				}
 				if (reply.text) {
 					output.content.push({ type: "text", text: "" });
 					stream.push({ type: "text_start", contentIndex: 0, partial: output });

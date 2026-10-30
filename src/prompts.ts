@@ -198,3 +198,8 @@ export function buildExecutorKickoff(request: string, plan: string, actionable =
 		: "The plan requires no changes: do not call any tools, edit files, or run commands. Just output the answer to the user.";
 	return `## User request (original prompt, verbatim)\n\n${request}\n\n## Plan (from planner)\n\n${plan}\n\n${instruction}`;
 }
+
+/** Appended to a task executor's kickoff when it retries a failed attempt that may have applied part of the plan. */
+export function buildExecutorRetryNote(error: string): string {
+	return `\n\nNote: a previous attempt at this task failed (${error}) and may have applied part of the plan already. Before each edit, \`read\` the file; skip changes that are already in place.`;
+}

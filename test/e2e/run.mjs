@@ -2,7 +2,7 @@
 // Usage: node test/e2e/run.mjs
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -198,5 +198,29 @@ assert.ok(forkExec.some((c) => c.firstUser.includes("## Already applied") && c.f
 assert.equal(readFileSync(join(project, "src/T1.txt"), "utf8"), "T1");
 assert.equal(readFileSync(join(project, "src/T2.txt"), "utf8"), "T2");
 console.log("fork-join run OK");
+
+// --- Sixth run: fork-join with failing subtasks. Sub-planner S2 answers empty once and task executor T2 errors
+// once; each is retried and the run completes. ---
+writeFileSync(log, "");
+rmSync(join(project, "src/T1.txt"));
+rmSync(join(project, "src/T2.txt"));
+const flaky = spawnSync(
+	process.execPath,
+	[cli, "--no-extensions", "-e", join(here, "mock-provider.ts"), "-e", join(root, "src/index.ts"), "--model", "mock/scout", "--session-dir", sessions, "-p", "fork: flaky: Add two files"],
+	{ cwd: project, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, MOCK_LOG: log }, encoding: "utf8", timeout: 120_000 },
+);
+assert.equal(flaky.status, 0, `flaky run failed: ${flaky.stderr}`);
+const flakyCalls = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+const flakyPlanner = flakyCalls.filter((c) => c.model === "planner");
+const flakyExec = flakyCalls.filter((c) => c.model === "executor");
+assert.equal(flakyPlanner.length, 5, "lead + 2 sub-planners + 1 retry of S2 + join");
+assert.equal(flakyPlanner.filter((c) => /subtask S2/.test(c.lastUser)).length, 2, "S2 retried once after an empty response");
+const t2 = flakyExec.filter((c) => c.messages === 1 && c.firstUser.includes("## Task T2"));
+assert.equal(t2.length, 2, "T2 executor retried once in a fresh session");
+assert.match(t2[1].firstUser, /a previous attempt at this task failed \(mock executor failure\)/, "retry kickoff names the previous error");
+assert.ok(flakyExec.some((c) => c.firstUser.includes("## Already applied")), "join executor runs after the retried task succeeds");
+assert.equal(readFileSync(join(project, "src/T1.txt"), "utf8"), "T1");
+assert.equal(readFileSync(join(project, "src/T2.txt"), "utf8"), "T2");
+console.log("retry run OK");
 
 console.log(`\nE2E OK (${work})`);

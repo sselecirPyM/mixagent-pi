@@ -52,7 +52,13 @@ import {
 	runPlanner,
 	splitPlan,
 } from "./planner.ts";
-import { buildExecutorKickoff, buildJoinInstructions, buildSubPlannerInstructions, SCOUT_APPEND } from "./prompts.ts";
+import {
+	buildExecutorKickoff,
+	buildExecutorRetryNote,
+	buildJoinInstructions,
+	buildSubPlannerInstructions,
+	SCOUT_APPEND,
+} from "./prompts.ts";
 import { findWriteReason } from "./safety.ts";
 import {
 	type AttachedFile,
@@ -75,6 +81,8 @@ const MAX_ATTACHED_FILES = 20;
 /** Raw size limit for image key files (~5 MB once base64-encoded, the common provider limit). */
 const MAX_IMAGE_BYTES = 3_750_000;
 const UPDATE_INTERVAL_MS = 150;
+/** Extra attempts for a failed fork-join subtask (sub-planner or task executor); aborts are not retried. */
+const MAX_TASK_RETRIES = 2;
 /** Tools that only exist during scout runs. */
 const SCOUT_ONLY_TOOLS = [HANDOFF_TOOL, DISCARD_TOOL];
 
@@ -86,6 +94,8 @@ interface SubPlanRun {
 	goal: string;
 	files: string[];
 	state: "pending" | "running" | "done";
+	/** 0 for the first attempt, then the retry number. */
+	attempt?: number;
 	text?: string;
 	result?: Pick<PlannerResult, "usage" | "stopReason" | "errorMessage">;
 }
@@ -98,6 +108,8 @@ interface TaskRun {
 	goal: string;
 	files: string[];
 	state: "pending" | "running" | "done";
+	/** 0 for the first attempt, then the retry number. */
+	attempt?: number;
 	executor?: ExecutorView;
 }
 
@@ -191,6 +203,49 @@ function emptyPlannerUsage(): PlannerResult["usage"] {
 		totalTokens: 0,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
+}
+
+function addPlannerUsage(a: PlannerResult["usage"], b: PlannerResult["usage"]): PlannerResult["usage"] {
+	return {
+		input: a.input + b.input,
+		output: a.output + b.output,
+		cacheRead: a.cacheRead + b.cacheRead,
+		cacheWrite: a.cacheWrite + b.cacheWrite,
+		totalTokens: a.totalTokens + b.totalTokens,
+		cost: {
+			input: a.cost.input + b.cost.input,
+			output: a.cost.output + b.cost.output,
+			cacheRead: a.cost.cacheRead + b.cost.cacheRead,
+			cacheWrite: a.cost.cacheWrite + b.cost.cacheWrite,
+			total: a.cost.total + b.cost.total,
+		},
+	};
+}
+
+function addExecutorUsage(a: ExecutorProgress["usage"], b: ExecutorProgress["usage"]): ExecutorProgress["usage"] {
+	return {
+		input: a.input + b.input,
+		output: a.output + b.output,
+		cacheRead: a.cacheRead + b.cacheRead,
+		cacheWrite: a.cacheWrite + b.cacheWrite,
+		cost: a.cost + b.cost,
+		turns: a.turns + b.turns,
+	};
+}
+
+/**
+ * Runs one fork-join subtask, retrying up to MAX_TASK_RETRIES times while it fails.
+ * fn returns the attempt's error (undefined on success) and gets the previous attempt's error on retries.
+ */
+async function retryTask(
+	signal: AbortSignal | undefined,
+	fn: (attempt: number, lastError: string | undefined) => Promise<string | undefined>,
+): Promise<void> {
+	let lastError: string | undefined;
+	for (let attempt = 0; attempt <= MAX_TASK_RETRIES; attempt++) {
+		lastError = await fn(attempt, lastError);
+		if (!lastError || signal?.aborted) return;
+	}
 }
 
 /** Runs fn over items with at most `limit` running at once. fn must not throw. */
@@ -502,16 +557,24 @@ export default function mixagent(pi: ExtensionAPI) {
 						run.result = { usage: emptyPlannerUsage(), stopReason: "aborted" };
 					} else {
 						run.state = "running";
-						pushUpdate();
-						try {
-							const r = await callPlanner(buildSubPlannerInstructions(lead, s.id, i + 1, subtasks.length), (text) => {
-								run.text = text;
-							});
-							run.text = r.text;
-							run.result = { usage: r.usage, stopReason: r.stopReason, errorMessage: plannerError(r) };
-						} catch (err) {
-							run.result = { usage: emptyPlannerUsage(), stopReason: "error", errorMessage: (err as Error).message };
-						}
+						// Usage of failed attempts is kept, so the shown tokens and cost cover every attempt.
+						let usage = emptyPlannerUsage();
+						await retryTask(signal, async (attempt) => {
+							run.attempt = attempt;
+							run.text = undefined;
+							pushUpdate();
+							try {
+								const r = await callPlanner(buildSubPlannerInstructions(lead, s.id, i + 1, subtasks.length), (text) => {
+									run.text = text;
+								});
+								usage = addPlannerUsage(usage, r.usage);
+								run.text = r.text;
+								run.result = { usage, stopReason: r.stopReason, errorMessage: plannerError(r) };
+							} catch (err) {
+								run.result = { usage, stopReason: "error", errorMessage: (err as Error).message };
+							}
+							return run.result.errorMessage;
+						});
 					}
 					run.state = "done";
 					pushUpdate();
@@ -624,15 +687,26 @@ export default function mixagent(pi: ExtensionAPI) {
 						run.executor = { ...idle(), stopReason: "aborted" };
 					} else {
 						run.state = "running";
-						run.executor = idle();
-						pushUpdate();
-						try {
-							run.executor = await execute(buildExecutorKickoff(request, task.plan), `${sessionName} [${task.id}]`, (progress) => {
-								run.executor = progress;
-							});
-						} catch (err) {
-							run.executor = { ...(run.executor ?? idle()), stopReason: "error", errorMessage: (err as Error).message };
-						}
+						// Usage of failed attempts is kept, so the shown tokens and cost cover every attempt.
+						let prior = emptyUsage();
+						const withPrior = <T extends ExecutorView>(ex: T): T => ({ ...ex, usage: addExecutorUsage(prior, ex.usage) });
+						await retryTask(signal, async (attempt, lastError) => {
+							run.attempt = attempt;
+							run.executor = withPrior(idle());
+							pushUpdate();
+							const kickoff = buildExecutorKickoff(request, task.plan) + (lastError ? buildExecutorRetryNote(lastError) : "");
+							try {
+								run.executor = withPrior(
+									await execute(kickoff, `${sessionName} [${task.id}]`, (progress) => {
+										run.executor = withPrior(progress);
+									}),
+								);
+							} catch (err) {
+								run.executor = { ...run.executor, stopReason: "error", errorMessage: (err as Error).message };
+							}
+							prior = run.executor.usage;
+							return run.executor.stopReason === "error" ? (run.executor.errorMessage ?? "executor error") : undefined;
+						});
 					}
 					run.state = "done";
 					pushUpdate();
@@ -726,6 +800,8 @@ export default function mixagent(pi: ExtensionAPI) {
 			const tokens = (u: PlannerResult["usage"] | undefined) =>
 				u ? ` ${formatTokens(u.input + u.cacheRead + u.cacheWrite)} in / ${formatTokens(u.output)} out · ${formatCost(u.cost.total)}` : "";
 			const planTokens = tokens(d.planner?.usage);
+			const retryLabel = (attempt: number | undefined) =>
+				attempt ? theme.fg("warning", ` (retry ${attempt}/${MAX_TASK_RETRIES})`) : "";
 			const planner = shortName(d.plannerModel ?? "planner");
 			const executor = shortName(d.executorModel ?? "executor");
 
@@ -754,13 +830,14 @@ export default function mixagent(pi: ExtensionAPI) {
 				if (expanded && d.leadPlan) container.addChild(new Markdown(d.leadPlan, 0, 0, md));
 				for (const s of d.subPlans) {
 					const goal = theme.fg("muted", `· ${s.goal}`);
+					const retry = retryLabel(s.attempt);
 					if (s.state === "pending") {
 						add(`  ${theme.fg("dim", "·")} ${theme.fg("accent", planner)} ${s.id} waiting ${goal}`);
 					} else if (isPartial && s.state === "running") {
-						add(`  ${theme.fg("warning", "⏳")} ${theme.fg("accent", planner)} ${s.id} planning… ${theme.fg("dim", `${s.text?.length ?? 0} chars out`)} ${goal}`);
+						add(`  ${theme.fg("warning", "⏳")} ${theme.fg("accent", planner)} ${s.id} planning…${retry} ${theme.fg("dim", `${s.text?.length ?? 0} chars out`)} ${goal}`);
 					} else {
 						const icon = s.result?.errorMessage ? theme.fg("error", "✗") : theme.fg("success", "✓");
-						add(`  ${icon} ${theme.fg("accent", planner)} ${s.id} planned${theme.fg("dim", tokens(s.result?.usage))} ${goal}`);
+						add(`  ${icon} ${theme.fg("accent", planner)} ${s.id} planned${retry}${theme.fg("dim", tokens(s.result?.usage))} ${goal}`);
 						if (expanded && s.text) container.addChild(new Markdown(s.text, 0, 0, md));
 					}
 				}
@@ -817,7 +894,7 @@ export default function mixagent(pi: ExtensionAPI) {
 					add(`${theme.fg("dim", "·")} ${theme.fg("accent", executor)} ${t.id} waiting ${theme.fg("muted", `· ${t.goal}`)}`);
 					continue;
 				}
-				add(`${stateIcon(t.executor, running)} ${theme.fg("accent", executor)} ${t.id} ${running ? "executing…" : "executed"}${theme.fg("dim", usageText(t.executor.usage))} ${theme.fg("muted", `· ${t.goal}`)}`);
+				add(`${stateIcon(t.executor, running)} ${theme.fg("accent", executor)} ${t.id} ${running ? "executing…" : "executed"}${retryLabel(t.attempt)}${theme.fg("dim", usageText(t.executor.usage))} ${theme.fg("muted", `· ${t.goal}`)}`);
 				if (running || expanded) addCalls(t.executor.toolCalls, expanded ? Infinity : 3);
 				if (expanded && !running && t.executor.output) container.addChild(new Markdown(t.executor.output, 0, 0, md));
 			}
