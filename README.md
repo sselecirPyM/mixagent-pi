@@ -65,9 +65,10 @@
 ```
 
 - **子 Planner**：每个子任务一次 Planner 调用，最多同时运行 `maxParallelPlanners` 个。每次调用收到同一份包，外加 lead 的拆分和「只写 S2」的说明，输出该子任务的完整方案
-- **join Planner**：所有子方案完成后再调用一次 Planner。它收到包、lead 的拆分和所有子方案，负责检查和合并：对齐接口，补上缺失的 import，把同一文件的多段修改合成一段，然后输出最终方案和合并后的 Commands。子方案里不需要改动的文件段，join 只写一行 `` ### `path` — from S1 ``，程序会把它原样替换成对应子方案的那一段，join 不必重复输出
+- **join Planner**：所有子方案完成后再调用一次 Planner。它收到包、lead 的拆分和所有子方案，只负责审查，不重写方案：检查接口是否对齐、import 是否缺失、SEARCH 是否有误、同一文件的修改块是否重叠，输出 `## Summary`、`## Revisions`（按文件列出关键修改意见，不写 SEARCH/REPLACE 块或完整代码）、合并后的 `## Commands` 和可选的 `## Tasks`
+- 最终方案由程序拼装：每份子方案的文件段原样保留（按文件归组，标题后标注来自哪个子方案），join 对该文件的修改意见接在后面；只出现在 Revisions 里的文件单独成段。Executor 会被告知这些意见不是精确的修改，优先级高于上面的修改块，需要自己 `read`/`grep` 找到具体位置再改
 - 所有 Planner 调用的系统提示词完全相同，包放在消息开头，角色说明附在末尾，所以子 Planner 和 join 可以命中 lead 写入的提示词缓存（取决于提供商是否支持缓存）
-- 子 Planner 失败（报错、空回复等）时自动重试，最多 2 次；重试后仍失败或被中止时直接报错，不启动 Executor。join 引用了任何子方案里都没有的文件段时也会报错（方案仍会保存）
+- 子 Planner 失败（报错、空回复等）时自动重试，最多 2 次；重试后仍失败或被中止时直接报错，不启动 Executor
 - 小任务或耦合紧密的任务不拆分：lead 直接写方案，只调用一次 Planner
 
 ### 执行：由 join 决定一个还是多个 Executor
@@ -80,7 +81,7 @@ join Planner 决定怎么执行。改动包含多个独立部分时，它会附�
 - T2: `src/c.ts` — 简短目标
 ```
 
-- 每组由一个新的 Executor session 执行，只收到方案摘要、`## Changes` 开头的共同说明和自己那几个文件的修改块，最多同时运行 `maxParallelExecutors` 个
+- 每组由一个新的 Executor session 执行，只收到方案摘要、`## Changes` 开头的共同说明和自己那几个文件的修改块，最多同时运行 `maxParallelExecutors` 个。方案已保存时（`planDir` 不为空），还会告诉它完整方案的路径：需要其他任务的上下文（例如别的任务定义的名字或签名）时可以 `read`/`grep` 它，但不能修改
 - 任务 Executor 出错时，用新的 session 重试，最多 2 次。重试时会提醒它前一次可能已改了部分文件，修改前先读文件，跳过已完成的修改。中止不重试
 - 所有任务完成后，如果方案有 `## Commands`，再用一个 Executor 统一运行命令（构建、测试），必要时做小修复；有任务失败或被中止时不运行
 - 每个文件只能属于一个任务，所以并行的 Executor 不会改同一个文件。分组不合法（文件没分配、重复分配、任务编号重复、只有一组）时退回到单个 Executor
@@ -203,7 +204,7 @@ prompt: 把问候语改得更友好
 
 第一行是原始提示词（折叠时只显示第一行，展开后显示全文）。展开（Ctrl+O）后显示原始提示词全文、Planner 的完整方案、所有工具调用、方案文件路径和 Executor session 路径。
 
-规划被拆分时，Planner 显示为多行：`✓ claude-opus-4-7 split into 3 subtask(s)`，每个子任务一行（`✓ claude-opus-4-7 S1 planned … · 目标`），然后是 `✓ claude-opus-4-7 join · N file change(s)`，每行都有各自的 token 和费用。展开后可以看到 lead 的拆分和每份子方案；保存的方案文件末尾也附有这些内容。
+规划被拆分时，Planner 显示为多行：`✓ claude-opus-4-7 split into 3 subtask(s)`，每个子任务一行（`✓ claude-opus-4-7 S1 planned … · 目标`），然后是 `✓ claude-opus-4-7 join · N file change(s)`，每行都有各自的 token 和费用。展开后可以看到 lead 的拆分和每份子方案；保存的方案文件末尾附有 lead 的拆分和 join 的审查意见（子方案的文件段已在方案正文里，不再重复）。
 
 执行被拆分成多个任务时，Planner 那一行后面会显示 `· N parallel task(s)`。每个任务单独一行（`✓ claude-haiku-4-5 T1 executed … · 目标`），执行中的任务会显示最近的工具调用。最后一行是运行 Commands 的 join Executor（`claude-haiku-4-5 commands executed`）。
 
@@ -226,7 +227,7 @@ npm test            # 单元测试：打包、裁剪、bash 拦截、方案解�
 npm run test:e2e    # 端到端：在真实 pi 进程里用脚本化的 mock provider 跑完整流程（不需要 API key）
 ```
 
-端到端测试会验证：Scout 带着只读工具和 handoff 运行；Planner 只收到 1 条消息、没有任何工具；Executor 在全新 session 里应用了修改；方案 .md 文件已保存；Executor session 关联了 parentSession；第二轮对话时上一轮的探索记录被裁掉；Scout 丢弃的结果被替换为提示、discard 调用不进入上下文；Scout 读取的图片作为图片块发给 Planner；Planner 拆分时按 lead + 子 Planner + join 共调用 4 次、系统提示词相同、join 的 `from S1` 引用被展开，各任务的 Executor 只收到自己的文件，并由最后一个 Executor 运行命令；`/mix off` 之后恢复为普通 pi。
+端到端测试会验证：Scout 带着只读工具和 handoff 运行；Planner 只收到 1 条消息、没有任何工具；Executor 在全新 session 里应用了修改；方案 .md 文件已保存；Executor session 关联了 parentSession；第二轮对话时上一轮的探索记录被裁掉；Scout 丢弃的结果被替换为提示、discard 调用不进入上下文；Scout 读取的图片作为图片块发给 Planner；Planner 拆分时按 lead + 子 Planner + join 共调用 4 次、系统提示词相同、子方案的文件段和 join 的修改意见被拼进最终方案，各任务的 Executor 只收到自己的文件，并由最后一个 Executor 运行命令；`/mix off` 之后恢复为普通 pi。
 
 源码结构：
 

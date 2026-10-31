@@ -200,7 +200,8 @@ assert.deepEqual(
 	"one sub-planner per subtask",
 );
 assert.match(forkPlanner[3].lastUser, /BEGIN plan S1[\s\S]*BEGIN plan S2/, "join planner sees both sub-plans");
-assert.ok(forkExec.some((c) => c.firstUser.includes("## Task T1") && c.firstUser.includes("T1\n````")), "join reference expanded from S1");
+assert.ok(forkExec.some((c) => c.firstUser.includes("## Task T1") && c.firstUser.includes("— create (S1)\n````text\nT1\n````")), "S1's file section used as written");
+assert.ok(forkExec.some((c) => c.firstUser.includes("## Task T2") && c.firstUser.includes("Revisions by the join planner") && c.firstUser.includes('exactly "T2"')), "join revision note follows S2's section");
 assert.equal(forkExec.length, 6, "two task executors + one join executor, two calls each");
 assert.equal(forkExec.filter((c) => c.messages === 1).length, 3, "three fresh executor sessions");
 assert.ok(forkExec.some((c) => c.firstUser.includes("## Task T1") && !c.firstUser.includes("src/T2.txt")), "task sub-plan holds only its own files");

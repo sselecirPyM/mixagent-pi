@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+	assembleJoinPlan,
 	countPlanChanges,
-	expandJoinPlan,
 	parseNeedContext,
 	parseSubtasks,
 	plannerContent,
@@ -288,16 +288,35 @@ test("parseSubtasks reads the lead split only when it has no file changes", () =
 	assert.equal(parseSubtasks("## Summary\nx"), undefined);
 });
 
-test("expandJoinPlan replaces 'from S<n>' headings with the sub-plan section", () => {
-	const s1 = "## Changes\n\n### `a.ts` — edit\nA-BLOCK\n\n### `b.ts` — create\nB-BODY";
-	const s2 = "## Changes\n\n### `./c.ts` — delete";
-	const join = "## Changes\n\n### `a.ts` — from S1\n\n### `c.ts` — from S1\n\n````text\n### `x.ts` — from S1\n````\n\n### `z.ts` — from S2";
-	const { plan, unresolved } = expandJoinPlan(join, new Map([["S1", s1], ["S2", s2]]));
-	assert.match(plan, /### `a.ts` — edit\nA-BLOCK/);
-	assert.match(plan, /### `\.\/c.ts` — delete/, "falls back to the sub-plan that has the file");
-	assert.match(plan, /````text\n### `x.ts` — from S1\n````/, "headings in fences are left alone");
-	assert.deepEqual(unresolved, ["z.ts from S2"]);
-	assert.equal(countPlanChanges(plan), 2);
+test("assembleJoinPlan appends the join's revision notes to the sub-plans' file sections", () => {
+	const s1 = "## Summary\nS1.\n\n## Changes\n\n### `a.ts` — edit\nA-BLOCK\n\n### `b.ts` — create\nB-BODY\n\n## Commands\nnpm test";
+	const s2 = "## Changes\n\n### `./a.ts` — edit\nA2-BLOCK";
+	const join =
+		"## Summary\nAll.\n\n## Revisions\n### `./a.ts`\n- use `foo`\n\n````text\n### `x.ts`\n````\n### `new.ts` — create\n- export `foo`\n### `b.ts`\n\n" +
+		"## Tasks\n- T1: `a.ts`, `new.ts` — a\n- T2: `b.ts` — b\n\n## Commands\n```bash\nnpm test\n```";
+	const plan = assembleJoinPlan(join, [
+		{ id: "S1", plan: s1 },
+		{ id: "S2", plan: s2 },
+	]);
+	assert.equal(
+		plan,
+		"## Summary\nAll.\n\n## Changes\n\n### `a.ts` — edit (S1)\nA-BLOCK\n\n### `./a.ts` — edit (S2)\nA2-BLOCK\n\n" +
+			"Revisions by the join planner (notes, not exact edits: `read`/`grep` the code to find the exact places, they take precedence over the blocks above):\n" +
+			"- use `foo`\n\n````text\n### `x.ts`\n````\n\n" +
+			"### `b.ts` — create (S1)\nB-BODY\n\n### `new.ts` — create\n" +
+			"Revisions by the join planner (notes, not exact edits: `read`/`grep` the code to find the exact places):\n- export `foo`\n\n" +
+			"## Tasks\n- T1: `a.ts`, `new.ts` — a\n- T2: `b.ts` — b\n\n## Commands\n```bash\nnpm test\n```",
+		"sections grouped by file, notes after them, empty notes and headings in fences ignored",
+	);
+	assert.equal(countPlanChanges(plan), 4);
+	const split = splitPlan(plan);
+	assert.match(split?.tasks[0].plan ?? "", /A2-BLOCK[\s\S]*use `foo`[\s\S]*export `foo`/);
+	assert.doesNotMatch(split?.tasks[1].plan ?? "", /foo/);
+});
+
+test("assembleJoinPlan uses a join that wrote its own Changes as is", () => {
+	const join = "## Changes\n\n### `a.ts` — edit\nJOIN-BLOCK";
+	assert.equal(assembleJoinPlan(join, [{ id: "S1", plan: "## Changes\n\n### `a.ts` — edit\nA-BLOCK" }]), join);
 });
 
 test("plannerContent appends role instructions after the package and images", () => {

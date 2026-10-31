@@ -51,18 +51,13 @@ T${id.slice(1)}
 \`\`\`\`
 `;
 
-/** Join plan: T1 is taken from S1 by reference, T2 is written out. */
+/** Join review: the sub-plans' file sections are used as written, with one revision note for T2. */
 const FORK_PLAN = `## Summary
 Add two files.
 
-## Changes
-
-### \`src/T1.txt\` — from S1
-
-### \`src/T2.txt\` — create
-\`\`\`\`text
-T2
-\`\`\`\`
+## Revisions
+### \`src/T2.txt\`
+- Keep the content exactly "T2", without a trailing newline.
 
 ## Tasks
 - T1: \`src/T1.txt\` — first file

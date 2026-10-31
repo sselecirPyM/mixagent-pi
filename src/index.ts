@@ -44,8 +44,8 @@ import {
 } from "./config.ts";
 import { type ExecutorProgress, type ExecutorResult, emptyUsage, runExecutor } from "./executor.ts";
 import {
+	assembleJoinPlan,
 	countPlanChanges,
-	expandJoinPlan,
 	type PlannerResult,
 	parseNeedContext,
 	parseSubtasks,
@@ -55,6 +55,7 @@ import {
 import {
 	buildExecutorKickoff,
 	buildExecutorRetryNote,
+	buildFullPlanNote,
 	buildJoinInstructions,
 	buildSubPlannerInstructions,
 	SCOUT_APPEND,
@@ -550,7 +551,7 @@ export default function mixagent(pi: ExtensionAPI) {
 			// 2b. Fork-join planning: the lead planner split the work into subtasks. Each subtask is planned by its
 			// own planner call in parallel, then a join planner call verifies and merges them into the final plan.
 			const subtasks = cfg.forkJoin ? parseSubtasks(result.text) : undefined;
-			let unresolved: string[] = [];
+			let joinReview: string | undefined;
 			if (subtasks) {
 				const lead = result.text;
 				details.leadPlan = lead;
@@ -606,9 +607,9 @@ export default function mixagent(pi: ExtensionAPI) {
 				details.join = { usage: joined.usage, stopReason: joined.stopReason };
 				const joinError = plannerError(joined);
 				if (joinError) return fail(`join planner: ${joinError}`);
-				const expanded = expandJoinPlan(joined.text, new Map(subPlans.map((s) => [s.id, s.plan])));
-				unresolved = expanded.unresolved;
-				result = { ...joined, text: expanded.plan };
+				// The join only reviews: the final plan is the sub-plans' file sections plus its revision notes.
+				joinReview = joined.text;
+				result = { ...joined, text: assembleJoinPlan(joined.text, subPlans) };
 				details.plan = result.text;
 			}
 
@@ -622,17 +623,14 @@ export default function mixagent(pi: ExtensionAPI) {
 					await mkdir(dir, { recursive: true });
 					const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 					details.planPath = join(dir, `plan-${stamp}.md`);
+					// The sub-plans' file sections are already in the plan, so only the lead split and the join review are added.
 					const planning = details.leadPlan
-						? `\n---\n\n# Planning (fork-join)\n\n## Lead\n\n${details.leadPlan}\n\n${(details.subPlans ?? []).map((s) => `## Sub-plan ${s.id} — ${s.goal}\n\n${s.text ?? ""}`).join("\n\n")}\n`
+						? `\n---\n\n# Planning (fork-join)\n\n## Lead\n\n${details.leadPlan}\n\n## Join review\n\n${joinReview ?? ""}\n`
 						: "";
 					await writeFile(details.planPath, `# MixAgent plan\n\n## Request\n\n${request}\n\n${result.text}\n${planning}`, "utf8");
 				} catch {
 					details.planPath = undefined;
 				}
-			}
-			if (unresolved.length > 0) {
-				const saved = details.planPath ? ` Plan saved to ${details.planPath}.` : "";
-				return fail(`join plan references sections no sub-plan has: ${unresolved.join(", ")}. The executor was not started.${saved}`);
 			}
 
 			// 4a. Nothing to apply: return the planner's answer directly, without starting an executor.
@@ -689,6 +687,8 @@ export default function mixagent(pi: ExtensionAPI) {
 				const runs: TaskRun[] = split.tasks.map((t) => ({ id: t.id, goal: t.goal, files: t.files, state: "pending" as const }));
 				details.tasks = runs;
 				pushUpdate();
+				// Each executor only gets its part of the plan; it may read the saved full plan for more context.
+				const planNote = details.planPath ? buildFullPlanNote(details.planPath) : "";
 				await runPool(split.tasks, cfg.maxParallelExecutors, async (task, i) => {
 					const run = runs[i];
 					if (signal?.aborted) {
@@ -702,7 +702,7 @@ export default function mixagent(pi: ExtensionAPI) {
 							run.attempt = attempt;
 							run.executor = withPrior(idle());
 							pushUpdate();
-							const kickoff = buildExecutorKickoff(request, task.plan) + (lastError ? buildExecutorRetryNote(lastError) : "");
+							const kickoff = buildExecutorKickoff(request, task.plan) + planNote + (lastError ? buildExecutorRetryNote(lastError) : "");
 							try {
 								run.executor = withPrior(
 									await execute(kickoff, `${sessionName} [${task.id}]`, (progress) => {
@@ -725,7 +725,7 @@ export default function mixagent(pi: ExtensionAPI) {
 					details.executor = idle();
 					pushUpdate();
 					try {
-						join = await execute(buildExecutorKickoff(request, split.joinPlan), `${sessionName} [join]`, (progress) => {
+						join = await execute(buildExecutorKickoff(request, split.joinPlan) + planNote, `${sessionName} [join]`, (progress) => {
 							details.executor = progress;
 						});
 					} catch (err) {

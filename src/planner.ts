@@ -128,32 +128,38 @@ function normalizePlanPath(p: string): string {
 	return p.trim().replace(/\\/g, "/").replace(/^\.\//, "");
 }
 
-/** Splits a plan into its `##` sections and `### \`path\`` file sections, ignoring headings inside code fences. */
-function parsePlanParts(plan: string): { sections: Map<string, string>; files: { path: string; text: string }[] } {
-	const sections = new Map<string, string[]>();
-	const files: { path: string; lines: string[] }[] = [];
-	let current: string[] | undefined;
+/** Calls fn for every line; `outsideFence` is false for code fence lines and the lines inside them. */
+function forEachLine(text: string, fn: (line: string, outsideFence: boolean) => void): void {
 	let fence = 0;
-	for (const line of plan.split(/\r?\n/)) {
+	for (const line of text.split(/\r?\n/)) {
 		const ticks = line.match(/^(`{3,})(.*)$/);
 		if (fence > 0) {
 			if (ticks && ticks[1].length >= fence && !ticks[2].trim()) fence = 0;
 		} else if (ticks) {
 			fence = ticks[1].length;
-		} else {
-			const file = line.match(FILE_HEADING);
-			const heading = line.match(/^##\s+(.+?)\s*$/);
-			if (file) {
-				current = [];
-				files.push({ path: normalizePlanPath(file[1]), lines: current });
-			} else if (heading) {
-				current = [];
-				sections.set(heading[1].toLowerCase(), current);
-				continue;
-			}
+		}
+		fn(line, fence === 0 && !ticks);
+	}
+}
+
+/** Splits a plan into its `##` sections and `### \`path\`` file sections, ignoring headings inside code fences. */
+function parsePlanParts(plan: string): { sections: Map<string, string>; files: { path: string; text: string }[] } {
+	const sections = new Map<string, string[]>();
+	const files: { path: string; lines: string[] }[] = [];
+	let current: string[] | undefined;
+	forEachLine(plan, (line, outsideFence) => {
+		const file = outsideFence && line.match(FILE_HEADING);
+		const heading = outsideFence && line.match(/^##\s+(.+?)\s*$/);
+		if (file) {
+			current = [];
+			files.push({ path: normalizePlanPath(file[1]), lines: current });
+		} else if (heading) {
+			current = [];
+			sections.set(heading[1].toLowerCase(), current);
+			return;
 		}
 		current?.push(line);
-	}
+	});
 	return {
 		sections: new Map([...sections].map(([k, v]): [string, string] => [k, v.join("\n").trim()])),
 		files: files.map((f) => ({ path: f.path, text: f.lines.join("\n").trim() })),
@@ -238,38 +244,56 @@ export function parseSubtasks(plan: string): Subtask[] | undefined {
 	return subtasks.length > 0 ? subtasks : undefined;
 }
 
-/**
- * Replaces the join planner's "### `path` — from S1" lines with that sub-plan's section for the file, so the
- * join does not repeat unchanged SEARCH/REPLACE blocks. Falls back to any sub-plan that has the file.
- * Returns the expanded plan and the references no sub-plan could resolve.
- */
-export function expandJoinPlan(join: string, subPlans: Map<string, string>): { plan: string; unresolved: string[] } {
-	const byId = new Map(
-		[...subPlans].map(([id, text]) => [id.toUpperCase(), new Map(parsePlanParts(text).files.map((f) => [f.path, f.text]))]),
-	);
-	const unresolved: string[] = [];
-	const out: string[] = [];
-	let fence = 0;
-	for (const line of join.split(/\r?\n/)) {
-		const ticks = line.match(/^(`{3,})(.*)$/);
-		if (fence > 0) {
-			if (ticks && ticks[1].length >= fence && !ticks[2].trim()) fence = 0;
-		} else if (ticks) {
-			fence = ticks[1].length;
+/** Heads the join's notes in a file section; the executor only learns how to apply them from here. */
+const REVISIONS_NOTE = "Revisions by the join planner (notes, not exact edits: `read`/`grep` the code to find the exact places";
+
+/** Parses the join planner's "## Revisions": one "### `path`" entry of notes per file. */
+function parseRevisions(join: string): { path: string; kind?: string; notes: string }[] {
+	const revisions: { path: string; kind?: string; lines: string[] }[] = [];
+	let inRevisions = false;
+	let current: string[] | undefined;
+	forEachLine(join, (line, outsideFence) => {
+		const heading = outsideFence && line.match(/^##\s+(.+?)\s*$/);
+		const file = outsideFence && inRevisions && line.match(/^###\s+`([^`]+)`\s*(?:[—-]\s*(edit|create|delete)\b)?/i);
+		if (heading) {
+			inRevisions = heading[1].toLowerCase() === "revisions";
+			current = undefined;
+		} else if (file) {
+			current = [];
+			revisions.push({ path: normalizePlanPath(file[1]), kind: file[2]?.toLowerCase(), lines: current });
 		} else {
-			const ref = line.match(/^###\s+`([^`]+)`\s*[—-]\s*from\s+\**(S\d+)\**\s*$/i);
-			if (ref) {
-				const path = normalizePlanPath(ref[1]);
-				const id = ref[2].toUpperCase();
-				const section = byId.get(id)?.get(path) ?? [...byId.values()].map((m) => m.get(path)).find(Boolean);
-				if (section) {
-					out.push(section);
-					continue;
-				}
-				unresolved.push(`${path} from ${id}`);
-			}
+			current?.push(line);
 		}
-		out.push(line);
+	});
+	return revisions.map((r) => ({ path: r.path, kind: r.kind, notes: r.lines.join("\n").trim() })).filter((r) => r.notes);
+}
+
+/**
+ * Builds the final fork-join plan, so the join planner never copies sub-plans: every sub-plan file section as
+ * written (grouped by file), followed by the join's revision notes for that file, then the join's Tasks, Commands
+ * and Answer. A join that wrote its own "## Changes" anyway is used as is.
+ */
+export function assembleJoinPlan(join: string, subPlans: { id: string; plan: string }[]): string {
+	const { sections } = parsePlanParts(join);
+	if (sections.has("changes")) return join;
+	const byPath = new Map<string, string[]>();
+	for (const s of subPlans) {
+		for (const f of parsePlanParts(s.plan).files) {
+			const [heading, ...body] = f.text.split("\n");
+			byPath.set(f.path, [...(byPath.get(f.path) ?? []), [`${heading} (${s.id})`, ...body].join("\n")]);
+		}
 	}
-	return { plan: out.join("\n"), unresolved };
+	for (const r of parseRevisions(join)) {
+		const parts = byPath.get(r.path);
+		if (parts) parts.push(`${REVISIONS_NOTE}, they take precedence over the blocks above):\n${r.notes}`);
+		else byPath.set(r.path, [`### \`${r.path}\` — ${r.kind ?? "edit"}\n${REVISIONS_NOTE}):\n${r.notes}`]);
+	}
+	const changes = [...byPath.values()].map((parts) => parts.join("\n\n")).join("\n\n");
+	return [
+		sections.get("summary") && `## Summary\n${sections.get("summary")}`,
+		changes && `## Changes\n\n${changes}`,
+		...["Tasks", "Commands", "Answer"].map((name) => sections.get(name.toLowerCase()) && `## ${name}\n${sections.get(name.toLowerCase())}`),
+	]
+		.filter(Boolean)
+		.join("\n\n");
 }
