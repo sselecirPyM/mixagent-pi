@@ -144,42 +144,25 @@ Sub-planners wrote these plans in parallel:
 
 ${subPlans.map((s) => `===== BEGIN plan ${s.id} — ${s.goal} =====\n${s.plan}\n===== END plan ${s.id} =====`).join("\n\n")}
 
-You are the reviewer, the last check before execution. Every file section of every
-sub-plan is passed to the executor as written, followed by your revision notes for that file. Executors can read and
-search the repository, so they find the exact places and surrounding code themselves.
-
+Write the final plan in the standard structure. You are the last check before execution:
 - The Design was kept brief, so sub-planners filled in details on their own; make those choices consistent.
 - Verify the sub-plans against the request, the files and each other: fix mismatched interfaces, missing imports or
-  exports, wrong SEARCH text and anything missing.
+  exports, wrong SEARCH text and anything missing. Several sections for the same file must become one section with
+  non-overlapping blocks.
+- To keep a sub-plan's section for a file unchanged, write only its heading as \`### \\\`path\\\` — from S1\`;
+  it is replaced by that section verbatim. Write the section out in full when you change it.
+- Merge and deduplicate the Commands.
+- Do not output "## Subtasks" or "## Need context".
 
-Output ONLY this structure:
-
-## Summary
-1-3 sentences: the overall change.
-
-## Revisions
-Omit this section if the sub-plans are consistent and complete. Otherwise one entry per file that needs a fix:
-### \`src/a.ts\`
-- Key revisions only, each a short precise note: what is wrong or missing and what to do instead, naming the exact
-  identifiers (e.g. "S2 calls \`load(path)\` but S1 defines \`load(path, opts)\`: pass \`{}\`", "add the import of \`load\`
-  from \`./b\`", "skip S2's second block: S1's first block already makes that change").
-- For a file no sub-plan changes, write the heading as \`### \\\`path\\\` — create\` (or edit, delete) and describe the content.
-
-## Commands
-The sub-plans' Commands, merged and deduplicated (one \`\`\`bash block). Omit if there are none.
-
-## Answer
-Only if the user asked a question: the answer, merged from the sub-plans' Answers. Omit otherwise.
+Execution: decide how the plan is applied. One executor is the default. If the changes have several independent parts,
+add after "## Changes" a Tasks section; each task is applied by its own executor, in parallel:
 
 ## Tasks
-Optional: decide how the plan is applied. One executor is the default. If the changes have several independent parts,
-split them; each task is applied by its own executor, in parallel:
 - T1: \`src/a.ts\`, \`src/b.ts\` — short goal
 - T2: \`src/c.ts\` — short goal
 
-- Use 2-5 tasks. Every file of every sub-plan and of your Revisions must be listed in exactly one task;
-- Put files whose edits must be checked together in the same task. Commands run once, after all tasks have finished.
-- Do not output "## Changes", "## Subtasks" or "## Need context".`;
+- Use 2-5 tasks. Every file in Changes must be listed in exactly one task; executors only see their own task's file sections.
+- Put files whose edits must be checked together in the same task. Commands run once, after all tasks have finished.`;
 }
 
 export const EXECUTOR_APPEND = `

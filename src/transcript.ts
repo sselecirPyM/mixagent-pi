@@ -242,18 +242,39 @@ function normalizePath(cwd: string, p: string): string {
 	return (isAbsolute(stripped) ? stripped : resolve(cwd, stripped)).replace(/\\/g, "/").toLowerCase();
 }
 
+/** A 1-based, inclusive range of lines. */
+export interface LineRange {
+	first: number;
+	last: number;
+}
+
+/** Lines a `read` step returned. Never too few: the notice pi appends to the output can add a couple of lines. */
+function readLines(step: ScoutStep): LineRange {
+	const offset = Number(step.args.offset);
+	const limit = Number(step.args.limit);
+	const first = offset > 1 ? Math.floor(offset) : 1;
+	const count = Math.min(step.output.split("\n").length, limit > 0 ? limit : Infinity);
+	return { first, last: first + count - 1 };
+}
+
 /**
  * Removes redundant steps: identical repeated calls (keep the latest) and reads of files
- * that are attached in full anyway.
+ * that are attached in full anyway. `cut` is the line range truncation dropped from an attached file.
  */
-export function dedupeSteps(steps: ScoutStep[], cwd: string, attachedFiles: string[]): ScoutStep[] {
-	const attached = new Set(attachedFiles.map((f) => normalizePath(cwd, f)));
+export function dedupeSteps(steps: ScoutStep[], cwd: string, attachedFiles: { path: string; cut?: LineRange }[]): ScoutStep[] {
+	const attached = new Map(attachedFiles.map((f) => [normalizePath(cwd, f.path), f.cut]));
 	const seen = new Set<string>();
 	const kept: ScoutStep[] = [];
 	for (let i = steps.length - 1; i >= 0; i--) {
 		const step = steps[i];
 		if (step.toolName === "read" && typeof step.args.path === "string" && !step.isError) {
-			if (attached.has(normalizePath(cwd, step.args.path))) continue;
+			const path = normalizePath(cwd, step.args.path);
+			if (attached.has(path)) {
+				// A read that reaches into the lines cut from a truncated file is the package's only copy of them.
+				const cut = attached.get(path);
+				const read = readLines(step);
+				if (!cut || read.last < cut.first || read.first > cut.last) continue;
+			}
 		}
 		const key = `${step.toolName}\u0000${JSON.stringify(step.args)}`;
 		if (seen.has(key)) continue;
@@ -263,12 +284,24 @@ export function dedupeSteps(steps: ScoutStep[], cwd: string, attachedFiles: stri
 	return kept.reverse();
 }
 
+/** Characters truncateMiddle keeps from the start of a text longer than `max`; the rest of `max` comes from the end. */
+const keptHead = (max: number) => Math.floor(max * 0.7);
+
 export function truncateMiddle(text: string, max: number): string {
 	if (text.length <= max) return text;
-	const head = Math.floor(max * 0.7);
+	const head = keptHead(max);
 	const tail = max - head;
 	const omitted = text.length - head - tail;
 	return `${text.slice(0, head)}\n… [${omitted} chars omitted] …\n${text.slice(text.length - tail)}`;
+}
+
+/** Lines that truncateMiddle(text, max) drops in whole or in part; undefined when nothing is dropped. */
+function truncatedLines(text: string, max: number): LineRange | undefined {
+	if (text.length <= max) return undefined;
+	const head = keptHead(max);
+	const tailStart = text.length - (max - head);
+	const lineAt = (index: number) => text.slice(0, index).split("\n").length;
+	return { first: lineAt(head), last: lineAt(tailStart - 1) };
 }
 
 export function describeCall(toolName: string, args: Record<string, any>): string {
@@ -425,7 +458,9 @@ export function buildPlannerPackage(input: PackageInput): PlannerPackage {
 	const steps = dedupeSteps(
 		cycle.steps,
 		cwd,
-		files.filter((f) => f.content !== undefined || f.image).map((f) => f.path),
+		files
+			.filter((f) => f.content !== undefined || f.image)
+			.map((f) => ({ path: f.path, cut: f.content === undefined ? undefined : truncatedLines(f.content, input.maxFileChars) })),
 	);
 	if (steps.length > 0) {
 		const rendered = steps.map((step, i) => {

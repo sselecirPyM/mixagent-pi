@@ -14,7 +14,7 @@
   "maxFileChars": 60000,
   "maxPackageChars": 300000,
   "maxPlannerImages": 10,
-  "maxContextRounds": 2,
+  "maxContextRounds": 3,
   "pruneScoutHistory": true,
   "persistExecutorSession": true,
   "forkJoin": true,

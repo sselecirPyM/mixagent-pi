@@ -79,7 +79,7 @@ export const DEFAULT_CONFIG: MixConfig = {
 	maxFileChars: 60_000,
 	maxPackageChars: 300_000,
 	maxPlannerImages: 10,
-	maxContextRounds: 2,
+	maxContextRounds: 3,
 	pruneScoutHistory: true,
 	persistExecutorSession: true,
 	forkJoin: true,

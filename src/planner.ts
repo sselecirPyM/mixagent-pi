@@ -36,6 +36,11 @@ export interface PlannerOptions {
 	 * of the message, so these calls reuse the prompt cache written by the lead call.
 	 */
 	extra?: string;
+	/**
+	 * Main session id. Providers use it for cache affinity, and subscription providers (opencode) require it
+	 * as a session header.
+	 */
+	sessionId?: string;
 	signal?: AbortSignal;
 	/** Called with the text generated so far (throttled by the caller if needed). */
 	onProgress?: (text: string) => void;
@@ -53,24 +58,30 @@ export function plannerContent(pkg: PlannerPackage, extra?: string): (TextConten
 	];
 }
 
-export async function runPlanner(pkg: PlannerPackage, opts: PlannerOptions): Promise<PlannerResult> {
-	const auth = await opts.modelRegistry.getApiKeyAndHeaders(opts.model);
-	if (!auth.ok) throw new Error(auth.error);
+/** Newer pi versions stream through the registry, which resolves auth and adds provider session headers. */
+type RegistryStream = { streamSimple?: typeof streamSimple };
 
-	const stream = streamSimple(
-		opts.model,
-		{
-			systemPrompt: opts.forkJoin ? PLANNER_SYSTEM + PLANNER_SPLIT : PLANNER_SYSTEM,
-			messages: [{ role: "user", content: plannerContent(pkg, opts.extra), timestamp: Date.now() }],
-		},
-		{
-			apiKey: auth.apiKey,
-			headers: auth.headers,
-			signal: opts.signal,
-			maxTokens: Math.min(opts.maxTokens, opts.model.maxTokens || opts.maxTokens),
-			reasoning: opts.model.reasoning && opts.thinking !== "off" ? opts.thinking : undefined,
-		},
-	);
+export async function runPlanner(pkg: PlannerPackage, opts: PlannerOptions): Promise<PlannerResult> {
+	const context = {
+		systemPrompt: opts.forkJoin ? PLANNER_SYSTEM + PLANNER_SPLIT : PLANNER_SYSTEM,
+		messages: [{ role: "user" as const, content: plannerContent(pkg, opts.extra), timestamp: Date.now() }],
+	};
+	const options = {
+		sessionId: opts.sessionId,
+		signal: opts.signal,
+		maxTokens: Math.min(opts.maxTokens, opts.model.maxTokens || opts.maxTokens),
+		reasoning: opts.model.reasoning && opts.thinking !== "off" ? opts.thinking : undefined,
+	};
+
+	const registry = opts.modelRegistry as unknown as RegistryStream;
+	let stream: ReturnType<typeof streamSimple>;
+	if (typeof registry.streamSimple === "function") {
+		stream = registry.streamSimple.call(opts.modelRegistry, opts.model, context, options);
+	} else {
+		const auth = await opts.modelRegistry.getApiKeyAndHeaders(opts.model);
+		if (!auth.ok) throw new Error(auth.error);
+		stream = streamSimple(opts.model, context, { ...options, apiKey: auth.apiKey, headers: auth.headers });
+	}
 
 	let text = "";
 	for await (const event of stream) {

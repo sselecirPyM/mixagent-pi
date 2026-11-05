@@ -505,6 +505,7 @@ export default function mixagent(pi: ExtensionAPI) {
 					maxTokens: cfg.plannerMaxTokens,
 					forkJoin: cfg.forkJoin,
 					extra,
+					sessionId: ctx.sessionManager.getSessionId(),
 					signal,
 					onProgress: (text) => {
 						onProgress(text);

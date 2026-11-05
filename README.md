@@ -41,7 +41,7 @@
 另外还会做一些压缩：
 
 - Scout 可以用 `discard` 工具丢弃无关的搜索结果（见下文），被丢弃的内容在 Scout 上下文和 Planner 包里都只剩一行提示
-- 重复的工具调用只保留最后一次；如果文件已经作为「关键文件」附了全文，对它的 `read` 结果就不再重复附带
+- 重复的工具调用只保留最后一次；如果文件已经作为「关键文件」附了全文，对它的 `read` 结果就不再重复附带。关键文件超过 `maxFileChars` 被截掉中间部分时，读到被截掉那些行的 `read` 仍会保留
 - 单个工具输出、单个文件、整个包都有字符上限（可配置）
 - 已完成的周期里，Scout 的探索记录会从后续上下文里裁掉，只保留 handoff 的结果（方案摘要和执行报告），所以 Haiku 的上下文也不会一直膨胀
 - Planner 觉得上下文不够时可以回复 `## Need context`，Scout 会补查后再次 handoff，次数由 `maxContextRounds` 限制
@@ -169,7 +169,7 @@ pi -e /path/to/mixagent/src/index.ts
 | `scoutBashGuard` | `true` | 拦截 Scout 执行可能有写操作的 bash 命令（rm、>、sed -i、git checkout、npm install…） |
 | `maxToolOutputChars` / `maxFileChars` / `maxPackageChars` | 2 万 / 6 万 / 30 万 | 打包时的字符上限 |
 | `maxPlannerImages` | `10` | 最多给 Planner 看几张图；设为 `0` 则不发送图片 |
-| `maxContextRounds` | `2` | Planner 最多能要求补充上下文几次 |
+| `maxContextRounds` | `3` | Planner 最多能要求补充上下文几次 |
 | `pruneScoutHistory` | `true` | 从后续上下文中裁掉已完成周期的探索记录 |
 | `persistExecutorSession` | `true` | 是否把 Executor session 保存到磁盘（能在 `/resume` 里看到，并通过 parentSession 关联到主 session） |
 | `forkJoin` | `true` | 允许把大任务拆成子任务，由多次 Planner 调用并行规划、join 合并，再由一个或多个 Executor 执行（见上文 fork-join） |

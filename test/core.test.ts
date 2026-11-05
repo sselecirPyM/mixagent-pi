@@ -101,6 +101,37 @@ test("package dedupes repeated calls and reads of attached files", () => {
 	assert.match(pkg, /```ts\nFULL_FILE\n```/);
 });
 
+test("package keeps reads that reach into the lines cut from a truncated key file", () => {
+	// 100 lines of 10 chars; maxFileChars 300 keeps the first 210 and the last 90 chars, so lines 22-91 are cut.
+	const lines = Array.from({ length: 100 }, (_, i) => `line ${String(i + 1).padStart(4, "0")}`);
+	const range = (from: number, to: number) => lines.slice(from - 1, to).join("\n");
+	const read = (id: string, args: Record<string, any>, output: string): Msg[] => [
+		call(id, "read", { path: "src/a.ts", ...args }),
+		result(id, "read", output),
+	];
+	const cycle = extractCycle([
+		user("task"),
+		...read("a", { offset: 1, limit: 21 }, `${range(1, 21)}\n\n[79 more lines in file. Use offset=22 to continue.]`),
+		...read("b", { offset: 50, limit: 5 }, range(50, 54)),
+		...read("c", {}, `${range(1, 10)}\n\n[Showing lines 1-10 of 100. Use offset=11 to continue.]`),
+		...read("d", { offset: 88, limit: 10 }, range(88, 97)),
+		...read("e", { offset: 92 }, range(92, 100)),
+	]);
+	const pkg = buildPlannerPackage({
+		cycle,
+		notes: "",
+		files: [{ path: "src/a.ts", content: lines.join("\n") }],
+		cwd: "/repo",
+		maxToolOutputChars: 1e4,
+		maxFileChars: 300,
+		maxPackageChars: 1e5,
+		maxImages: 0,
+	}).text;
+	assert.match(pkg, /line 0021\n\n… \[699 chars omitted\] …\n\nline 0092/, "key file keeps lines 1-21 and 92-100");
+	const kept = [...pkg.matchAll(/^## \d+\. (.+)$/gm)].map((m) => m[1]);
+	assert.deepEqual(kept, ["read src/a.ts (offset 50, limit 5)", "read src/a.ts (offset 88, limit 10)"]);
+});
+
 test("package fences survive content containing backticks", () => {
 	const cycle = extractCycle([user("t"), call("a", "bash", { command: "cat r.md" }), result("a", "bash", "```js\nx\n```")]);
 	const pkg = buildPlannerPackage({ cycle, notes: "", files: [], cwd: "/", maxToolOutputChars: 1e4, maxFileChars: 1e4, maxPackageChars: 1e5, maxImages: 0 }).text;
