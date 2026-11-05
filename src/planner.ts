@@ -255,8 +255,63 @@ export function parseSubtasks(plan: string): Subtask[] | undefined {
 	return subtasks.length > 0 ? subtasks : undefined;
 }
 
+/** One `### \`path\` — kind` section of a plan. */
+export interface FileSection {
+	/** The heading line as written. */
+	heading: string;
+	/** Normalized path from the heading. */
+	path: string;
+	kind: "edit" | "create" | "delete";
+	/** The lines after the heading, up to the next file section or `##` heading. */
+	body: string;
+}
+
+/**
+ * Rebuilds the plan with fn's replacement for each file section (heading included); undefined keeps the section.
+ * Sections end like in parsePlanParts: at the next file section or `##` heading outside code fences.
+ */
+export function mapFileSections(plan: string, fn: (section: FileSection, index: number) => string | undefined): string {
+	const out: string[] = [];
+	let current: { heading: string; path: string; kind: FileSection["kind"]; lines: string[] } | undefined;
+	let index = 0;
+	const flush = () => {
+		if (!current) return;
+		const { lines, ...section } = current;
+		const replaced = fn({ ...section, body: lines.join("\n") }, index++);
+		if (replaced === undefined) {
+			out.push(section.heading, ...lines);
+		} else {
+			// Keep the blank lines that separate the section from the next one.
+			let end = lines.length;
+			while (end > 0 && !lines[end - 1].trim()) end--;
+			out.push(replaced, ...lines.slice(end));
+		}
+		current = undefined;
+	};
+	forEachLine(plan, (line, outsideFence) => {
+		const file = outsideFence && line.match(FILE_HEADING);
+		if (file || (outsideFence && /^##\s+(.+?)\s*$/.test(line))) flush();
+		if (file) {
+			current = { heading: line, path: normalizePlanPath(file[1]), kind: file[2].toLowerCase() as FileSection["kind"], lines: [] };
+		} else if (current) {
+			current.lines.push(line);
+		} else {
+			out.push(line);
+		}
+	});
+	flush();
+	return out.join("\n");
+}
+
+/** The plan's file sections, in order. */
+export function fileSections(plan: string): FileSection[] {
+	const sections: FileSection[] = [];
+	mapFileSections(plan, (section) => void sections.push(section));
+	return sections;
+}
+
 /** Heads the join's notes in a file section; the executor only learns how to apply them from here. */
-const REVISIONS_NOTE = "Revisions by the join planner (notes, not exact edits: `read`/`grep` the code to find the exact places";
+export const REVISIONS_NOTE = "Revisions by the join planner (notes, not exact edits: `read`/`grep` the code to find the exact places";
 
 /** Parses the join planner's "## Revisions": one "### `path`" entry of notes per file. */
 function parseRevisions(join: string): { path: string; kind?: string; notes: string }[] {

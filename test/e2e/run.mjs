@@ -66,13 +66,15 @@ assert.ok(planner[0].plannerPrompt && planner[0].tools.length === 0 && planner[0
 assert.match(planner[0].firstUser, /Make the greeting friendlier/);
 assert.match(planner[0].firstUser, /grep -rn greet src/, "scout tool call included");
 assert.match(planner[0].firstUser, /return "hello " \+ name;/, "attached file included");
-assert.equal(executor.length, 2, "executor: edit call + final report");
+assert.equal(executor.length, 1, "executor: only the report, MixAgent auto-applied the edit");
 assert.ok(executor[0].executorPrompt && !executor[0].scoutPrompt, "executor runs with executor prompt only");
 assert.equal(executor[0].messages, 1, "executor starts in a fresh session");
 assert.ok(executor[0].tools.includes("edit") && !executor[0].tools.includes("handoff"));
+assert.match(executor[0].firstUser, /### `src\/greet.ts` — edit\nUse a template string.\n\nApplied by MixAgent \(done, do not apply again\): Successfully replaced 1 block/, "executor is told the edit result");
+assert.ok(!executor[0].firstUser.includes("<<<<<<< SEARCH"), "applied blocks are not sent again");
 
 const source = readFileSync(join(project, "src/greet.ts"), "utf8");
-assert.match(source, /return `Hello, \$\{name\}!`;/, "executor applied the plan");
+assert.match(source, /return `Hello, \$\{name\}!`;/, "the plan was applied");
 assert.equal(readdirSync(join(work, "plans")).length, 1, "plan markdown saved");
 
 const sessionFiles = readdirSync(sessions).filter((f) => f.endsWith(".jsonl"));
@@ -141,6 +143,11 @@ assert.equal(scouts.length, 4, "two scout calls per cycle");
 // Cycle 2 first call: [user, assistant(handoff), toolResult(handoff), user] — exploration of cycle 1 pruned.
 assert.deepEqual(scouts[2].roles, ["user", "assistant", "toolResult", "user"], "finished cycle pruned");
 assert.equal(rpcCalls.filter((c) => c.model === "planner").length, 2);
+const rpcExec = rpcCalls.filter((c) => c.model === "executor" && c.messages === 1);
+assert.ok(
+	rpcExec.length === 2 && rpcExec.every((c) => c.firstUser.includes("<<<<<<< SEARCH") && !c.firstUser.includes("MixAgent could not apply")),
+	"SEARCH no longer matches exactly (already applied): left to the executor untried, blocks kept",
+);
 console.log(`rpc two-prompt run OK, cycle-2 scout context: [${scouts[2].roles.join(", ")}]`);
 
 // --- Third run: the scout discards an irrelevant search result. ---
@@ -200,13 +207,14 @@ assert.deepEqual(
 	"one sub-planner per subtask",
 );
 assert.match(forkPlanner[3].lastUser, /BEGIN plan S1[\s\S]*BEGIN plan S2/, "join planner sees both sub-plans");
-assert.ok(forkExec.some((c) => c.firstUser.includes("## Task T1") && c.firstUser.includes("— create (S1)\n````text\nT1\n````")), "S1's file section used as written");
+assert.ok(forkExec.some((c) => c.firstUser.includes("## Task T1") && c.firstUser.includes("— create (S1)\nApplied by MixAgent (done, do not apply again): Successfully wrote")), "S1's create auto-applied");
 assert.ok(forkExec.some((c) => c.firstUser.includes("## Task T2") && c.firstUser.includes("Revisions by the join planner") && c.firstUser.includes('exactly "T2"')), "join revision note follows S2's section");
-assert.equal(forkExec.length, 6, "two task executors + one join executor, two calls each");
+assert.ok(forkExec.some((c) => c.firstUser.includes("## Task T2") && c.firstUser.includes("````text\nT2\n````")), "a section with revision notes is left to the executor");
+assert.equal(forkExec.length, 5, "T1 executor reports only, T2 executor writes + reports, join executor runs the commands + reports");
 assert.equal(forkExec.filter((c) => c.messages === 1).length, 3, "three fresh executor sessions");
 assert.ok(forkExec.some((c) => c.firstUser.includes("## Task T1") && !c.firstUser.includes("src/T2.txt")), "task sub-plan holds only its own files");
 assert.ok(forkExec.some((c) => c.firstUser.includes("## Already applied") && c.firstUser.includes("echo joined")), "join executor runs the commands");
-assert.equal(readFileSync(join(project, "src/T1.txt"), "utf8"), "T1");
+assert.equal(readFileSync(join(project, "src/T1.txt"), "utf8"), "T1\n", "auto-applied new file ends with a newline");
 assert.equal(readFileSync(join(project, "src/T2.txt"), "utf8"), "T2");
 console.log("fork-join run OK");
 
@@ -230,7 +238,7 @@ const t2 = flakyExec.filter((c) => c.messages === 1 && c.firstUser.includes("## 
 assert.equal(t2.length, 2, "T2 executor retried once in a fresh session");
 assert.match(t2[1].firstUser, /a previous attempt at this task failed \(mock executor failure\)/, "retry kickoff names the previous error");
 assert.ok(flakyExec.some((c) => c.firstUser.includes("## Already applied")), "join executor runs after the retried task succeeds");
-assert.equal(readFileSync(join(project, "src/T1.txt"), "utf8"), "T1");
+assert.equal(readFileSync(join(project, "src/T1.txt"), "utf8"), "T1\n", "auto-applied new file ends with a newline");
 assert.equal(readFileSync(join(project, "src/T2.txt"), "utf8"), "T2");
 console.log("retry run OK");
 

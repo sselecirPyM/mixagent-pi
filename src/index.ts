@@ -10,6 +10,8 @@
  *   3. A new pi session is created for the executor (default Haiku), which applies the plan. Its final
  *      report is shown in the handoff tool result. If the plan has no changes or commands (e.g. the user
  *      only asked a question), the planner's answer is shown directly and no executor is started.
+ *      Before the executor starts, MixAgent applies the plan's exact file changes itself (apply.ts); the
+ *      executor's plan notes each result, so it only does the rest (unclear changes, commands, the report).
  *      If the final plan splits execution into tasks (## Tasks, disjoint files; written by the join planner),
  *      one executor per task runs in parallel, then one more executor runs the plan's commands.
  *
@@ -31,6 +33,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
+import { type AppliedFile, autoApplyPlan } from "./apply.ts";
 import {
 	globalConfigPath,
 	isThinkingLevel,
@@ -135,6 +138,8 @@ interface HandoffDetails {
 	join?: Pick<PlannerResult, "usage" | "stopReason">;
 	/** True when the plan had nothing to apply and the planner's answer was returned without an executor. */
 	answeredDirectly?: boolean;
+	/** Set when auto-apply ran: per file, what MixAgent applied itself before the executors started. */
+	applied?: AppliedFile[];
 	/** In fork-join mode: the join executor that runs the Commands (if any). */
 	executor?: ExecutorView;
 	/** Set in fork-join mode: one executor per task, run in parallel. */
@@ -648,8 +653,21 @@ export default function mixagent(pi: ExtensionAPI) {
 				return finish(lines.filter(Boolean).join("\n"), "done", ctx.hasUI);
 			}
 
-			// 4b. Executors: fresh sessions on the cheap model apply the plan.
+			// 4b. Auto-apply: MixAgent applies the plan's exact file changes itself, and the executors' plan notes each
+			// result in place. The executors still run for the rest, the Commands and the report.
 			details.stage = "executing";
+			let execPlan = result.text;
+			if (cfg.autoApply) {
+				try {
+					const auto = await autoApplyPlan(result.text, ctx.cwd, signal);
+					execPlan = auto.plan;
+					if (auto.files.length > 0) details.applied = auto.files;
+				} catch {
+					// Only an optimization, and it throws before applying anything: the executors apply the whole plan.
+				}
+			}
+
+			// 4c. Executors: fresh sessions on the cheap model apply the plan.
 			const sessionName = `mixagent: ${request.split("\n")[0].slice(0, 60)}`;
 			const idle = (): ExecutorView => ({ toolCalls: [], text: "", usage: emptyUsage() });
 			const execute = (kickoff: string, name: string, onProgress: (progress: ExecutorProgress) => void) =>
@@ -683,7 +701,7 @@ export default function mixagent(pi: ExtensionAPI) {
 			let lines: string[];
 			// Fork-join: the planner split the work into tasks with disjoint files; each task runs in its own
 			// executor in parallel, then one more executor runs the plan's Commands.
-			const split = cfg.forkJoin ? splitPlan(result.text) : undefined;
+			const split = cfg.forkJoin ? splitPlan(execPlan) : undefined;
 			if (split) {
 				const runs: TaskRun[] = split.tasks.map((t) => ({ id: t.id, goal: t.goal, files: t.files, state: "pending" as const }));
 				details.tasks = runs;
@@ -749,7 +767,7 @@ export default function mixagent(pi: ExtensionAPI) {
 				pushUpdate();
 				let exec: ExecutorResult;
 				try {
-					exec = await execute(buildExecutorKickoff(request, result.text), sessionName, (progress) => {
+					exec = await execute(buildExecutorKickoff(request, execPlan), sessionName, (progress) => {
 						details.executor = progress;
 					});
 				} catch (err) {
@@ -887,14 +905,30 @@ export default function mixagent(pi: ExtensionAPI) {
 					: ex.stopReason === "error" || ex.stopReason === "aborted"
 						? theme.fg("error", "✗")
 						: theme.fg("success", "✓");
+			const truncate = (s: string) => (s.length > 120 ? `${s.slice(0, 117)}...` : s);
 			const addCalls = (calls: ExecutorProgress["toolCalls"], keep: number) => {
 				const shown = keep >= calls.length ? calls : calls.slice(calls.length - keep);
 				if (calls.length > shown.length) add(theme.fg("dim", `  … ${calls.length - shown.length} earlier tool call(s)`));
 				for (const c of shown) {
 					const icon = !c.done ? theme.fg("warning", "·") : c.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-					add(`  ${icon} ${theme.fg("muted", c.label.length > 120 ? `${c.label.slice(0, 117)}...` : c.label)}`);
+					add(`  ${icon} ${theme.fg("muted", truncate(c.label))}`);
 				}
 			};
+
+			// Auto-apply line: the file changes MixAgent applied itself before the executors started.
+			const applied = d.applied;
+			if (applied) {
+				const count = (status: AppliedFile["status"]) => applied.filter((f) => f.status === status).length;
+				const failed = count("failed");
+				const icon = failed ? theme.fg("warning", "!") : count("applied") ? theme.fg("success", "✓") : theme.fg("dim", "·");
+				add(`${icon} auto-applied ${count("applied")} of ${applied.length} file(s)${failed ? theme.fg("warning", ` · ${failed} failed`) : ""}`);
+				if (expanded) {
+					for (const f of applied) {
+						const mark = f.status === "applied" ? theme.fg("success", "✓") : f.status === "failed" ? theme.fg("error", "✗") : theme.fg("dim", "·");
+						add(`  ${mark} ${theme.fg("muted", truncate(`${f.kind} ${f.path}${f.status === "applied" ? "" : `: ${f.message}`}`))}`);
+					}
+				}
+			}
 
 			// Fork-join task lines: one executor per task, running in parallel.
 			for (const t of d.tasks ?? []) {
@@ -1089,6 +1123,7 @@ export default function mixagent(pi: ExtensionAPI) {
 						`MixAgent: ${config.enabled ? "on" : "off"}`,
 						...ROLES.map((r) => `  ${r.padEnd(8)} ${config![roleKey(r)]}  (thinking: ${config![`${r}Thinking`]})`),
 						`  fork-join: ${config.forkJoin ? `on (max ${config.maxParallelPlanners} parallel planners, ${config.maxParallelExecutors} parallel executors)` : "off"}`,
+						`  auto-apply: ${config.autoApply ? "on" : "off"}`,
 						`  config: ${globalConfigPath(getAgentDir())}, ${projectConfigPath(ctx.cwd)}`,
 					];
 					ctx.ui.notify(lines.join("\n"), "info");

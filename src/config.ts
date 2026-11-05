@@ -51,6 +51,11 @@ export interface MixConfig {
 	/** Persist the executor session to disk (shows up in /resume). */
 	persistExecutorSession: boolean;
 	/**
+	 * Apply the plan's exact file changes (SEARCH/REPLACE edits, new and deleted files) directly before the executor
+	 * starts. The executor is told each result and only does the rest (unclear changes, Commands, the report).
+	 */
+	autoApply: boolean;
+	/**
 	 * Fork-join planning: the planner may split large work into subtasks, each planned by its own planner call,
 	 * then merged by a join planner call that may also split execution across parallel executors.
 	 */
@@ -69,7 +74,7 @@ export const DEFAULT_CONFIG: MixConfig = {
 	plannerModel: "anthropic/claude-opus-4-7",
 	executorModel: "anthropic/claude-haiku-4-5",
 	scoutThinking: "off",
-	plannerThinking: "medium",
+	plannerThinking: "high",
 	executorThinking: "off",
 	plannerMaxTokens: 32000,
 	scoutTools: ["read", "bash", "grep", "find", "ls"],
@@ -77,11 +82,12 @@ export const DEFAULT_CONFIG: MixConfig = {
 	scoutBashGuard: true,
 	maxToolOutputChars: 20_000,
 	maxFileChars: 60_000,
-	maxPackageChars: 300_000,
+	maxPackageChars: 500_000,
 	maxPlannerImages: 10,
 	maxContextRounds: 3,
 	pruneScoutHistory: true,
 	persistExecutorSession: true,
+	autoApply: true,
 	forkJoin: true,
 	maxParallelPlanners: 4,
 	maxParallelExecutors: 4,

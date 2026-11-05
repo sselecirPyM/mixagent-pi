@@ -86,3 +86,19 @@ test("fork-join planning shows the lead split, one line per sub-planner and the 
 	assert.match(finished, /claude-opus-4-7 join · 1 file change\(s\)/);
 	assert.match(finished, /claude-haiku-4-5 executed/);
 });
+
+test("auto-apply line counts applied files and lists each outcome when expanded", () => {
+	const applied = [
+		{ path: "src/greet.ts", kind: "edit", status: "applied", message: "Successfully replaced 1 block(s) in src/greet.ts." },
+		{ path: "src/b.ts", kind: "edit", status: "failed", message: "Found 2 occurrences" },
+		{ path: "src/c.ts", kind: "edit", status: "skipped", message: "no SEARCH/REPLACE blocks" },
+	];
+	const collapsed = render({ ...done, applied }, { expanded: false, isPartial: false });
+	assert.match(collapsed, /! auto-applied 1 of 3 file\(s\) · 1 failed/);
+	assert.ok(!collapsed.includes("Found 2 occurrences"));
+	const expanded = render({ ...done, applied }, { expanded: true, isPartial: false });
+	assert.match(expanded, /✓ edit src\/greet\.ts *\n/);
+	assert.match(expanded, /✗ edit src\/b\.ts: Found 2 occurrences/);
+	assert.match(expanded, /· edit src\/c\.ts: no SEARCH\/REPLACE blocks/);
+	assert.ok(!render(done, { expanded: false, isPartial: false }).includes("auto-applied"), "no line without auto-apply");
+});

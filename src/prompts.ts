@@ -181,8 +181,17 @@ commits, formatting, or cleanups.
 - Write in the same language as the user's request.
 `;
 
+/** Ends a plan file section that MixAgent applied itself before the executor started (see apply.ts). */
+export const AUTO_APPLIED = "Applied by MixAgent (done, do not apply again)";
+/** Ends a plan file section that MixAgent tried to apply and could not. */
+export const AUTO_APPLY_FAILED = "MixAgent could not apply this section (the file is unchanged)";
+
+const AUTO_APPLY_NOTE = `MixAgent already applied the sections marked "Applied by MixAgent" with pi's edit/write tools, exactly as planned; the tool result is shown in place of their content. Do not apply them again. Sections marked "MixAgent could not apply" are unchanged on disk: apply them yourself, and if the error says the text was not found, \`read\` the file first.`;
+
 export function buildExecutorKickoff(request: string, plan: string): string {
-	return `## User request (original prompt, verbatim)\n\n${request}\n\n## Plan (from planner)\n\n${plan}\n\nApply the plan now.`;
+	const autoApplied = plan.includes(AUTO_APPLIED) || plan.includes(AUTO_APPLY_FAILED);
+	const end = autoApplied ? `${AUTO_APPLY_NOTE}\n\nApply the rest of the plan now.` : "Apply the plan now.";
+	return `## User request (original prompt, verbatim)\n\n${request}\n\n## Plan (from planner)\n\n${plan}\n\n${end}`;
 }
 
 /** Appended to a fork-join executor's kickoff: it only sees its part of the plan, the full plan may be long. */

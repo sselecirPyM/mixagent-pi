@@ -133,6 +133,10 @@ function script(model: Model<any>, ctx: Context): Reply {
 				if (task === "T2" && lastText(ctx).includes("flaky") && !lastText(ctx).includes("a previous attempt at this task failed")) {
 					return { error: "mock executor failure" };
 				}
+				// Everything was auto-applied by MixAgent: only the report is left.
+				if (lastText(ctx).includes("Applied by MixAgent") && !lastText(ctx).includes("## Commands")) {
+					return { text: "Executor done. Auto-applied by MixAgent." };
+				}
 				if (task) return { toolCall: { name: "write", arguments: { path: `src/${task}.txt`, content: task } } };
 				if (lastText(ctx).includes("## Already applied")) return { toolCall: { name: "bash", arguments: { command: "echo joined" } } };
 				return {

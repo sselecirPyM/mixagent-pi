@@ -23,7 +23,8 @@
    │  join 可以附带 ## Tasks，把文件分成互不重叠的几组，交给多个 Executor
    ▼
 ③ Executor（默认 Haiku，全新的 pi session）
-   按方案调用 edit / write / bash 执行修改
+   启动前，MixAgent 先用 pi 的 edit / write 工具直接应用方案里明确的修改（自动应用），
+   并在方案里注明每处的结果；Executor 只做剩下的部分（不明确的修改、Commands、报告）
    有 ## Tasks 时：每组一个 Executor 并行执行，全部完成后再用一个 Executor 运行 Commands
    │
    ▼
@@ -88,6 +89,24 @@ join Planner 决定怎么执行。改动包含多个独立部分时，它会附�
 - 没有 `## Tasks` 时用单个 Executor
 
 设置 `"forkJoin": false` 可以全部关闭：Planner 不会收到拆分说明，只调用一次。
+
+## 自动应用
+
+Executor 的前几轮通常只是把方案里的 SEARCH/REPLACE 块原样抄进 `edit` 调用，输出量和整个 diff 一样大。所以在启动 Executor 之前，MixAgent 先解析方案，把其中明确的修改直接应用掉：
+
+- **edit**：段里只有 SEARCH/REPLACE 块（外加说明文字），并且每个 SEARCH 都和文件**完全一致**。同一文件的所有块合成一次 pi `edit` 调用，所以行尾（CRLF）、BOM、唯一性和重叠检查都和 Executor 自己调用时一样；一个文件要么全部应用，要么完全不动
+- **create**：段里只有一个代码块（文件内容），并且文件还不存在，用 pi 的 `write` 写入
+- **delete**：文件在工作目录内，直接删除
+
+以下情况不自动应用，原样交给 Executor：块的格式不规范或有歧义（例如一个块里有两个 `=======`）、块外还有代码、SEARCH 只有在 pi 的模糊匹配下才能匹配（模糊匹配会改写整个文件的行尾空白、引号等）、join Planner 写了修改意见的文件、同一文件既有 edit 又有 delete、路径在工作目录之外。
+
+Executor 收到的方案里，每处结果直接写在对应的文件段末尾：
+
+- 已应用：保留说明文字，代码块换成一行 `Applied by MixAgent (done, do not apply again): <工具结果>`，修改内容不会再发一遍
+- 应用失败（例如 SEARCH 出现多次、文件不存在）：保留原段内容，末尾加 `MixAgent could not apply this section (the file is unchanged): <错误>`，由 Executor 处理
+- 未尝试的段保持原样
+
+Executor 的提示词末尾会说明这些标记的含义。之后仍然启动 Executor：运行 Commands、处理剩下的修改、写报告。fork-join 时自动应用在所有任务开始之前统一进行一次，每个任务只看到自己文件的结果。设置 `"autoApply": false` 可以关闭，恢复为 Executor 应用全部修改。
 
 ## discard 工具
 
@@ -172,6 +191,7 @@ pi -e /path/to/mixagent/src/index.ts
 | `maxContextRounds` | `3` | Planner 最多能要求补充上下文几次 |
 | `pruneScoutHistory` | `true` | 从后续上下文中裁掉已完成周期的探索记录 |
 | `persistExecutorSession` | `true` | 是否把 Executor session 保存到磁盘（能在 `/resume` 里看到，并通过 parentSession 关联到主 session） |
+| `autoApply` | `true` | 启动 Executor 前由 MixAgent 直接应用方案里明确的修改，并把结果告诉 Executor（见上文「自动应用」） |
 | `forkJoin` | `true` | 允许把大任务拆成子任务，由多次 Planner 调用并行规划、join 合并，再由一个或多个 Executor 执行（见上文 fork-join） |
 | `maxParallelPlanners` | `4` | fork-join 时同时运行的子 Planner 数量上限 |
 | `maxParallelExecutors` | `4` | fork-join 时同时运行的任务 Executor 数量上限 |
@@ -195,14 +215,14 @@ handoff 工具的结果折叠时显示：
 ```
 prompt: 把问候语改得更友好
 ✓ claude-opus-4-7 plan · 2 file change(s) 8.1k in / 612 out · $0.087
-✓ claude-haiku-4-5 executed 3 turn(s) · 14k in / 420 out · $0.006
-  ✓ edit {"path":"src/greet.ts",...}
+✓ auto-applied 2 of 2 file(s)
+✓ claude-haiku-4-5 executed 2 turn(s) · 9k in / 180 out · $0.003
   ✓ $ npm test
 
 （Executor 的报告，以 Markdown 渲染）
 ```
 
-第一行是原始提示词（折叠时只显示第一行，展开后显示全文）。展开（Ctrl+O）后显示原始提示词全文、Planner 的完整方案、所有工具调用、方案文件路径和 Executor session 路径。
+第一行是原始提示词（折叠时只显示第一行，展开后显示全文）。`auto-applied` 一行是 MixAgent 自动应用的文件数，有失败时显示为 `! … · N failed`。展开（Ctrl+O）后显示原始提示词全文、Planner 的完整方案、每个文件的自动应用结果（失败或未尝试的会附上原因）、所有工具调用、方案文件路径和 Executor session 路径。
 
 规划被拆分时，Planner 显示为多行：`✓ claude-opus-4-7 split into 3 subtask(s)`，每个子任务一行（`✓ claude-opus-4-7 S1 planned … · 目标`），然后是 `✓ claude-opus-4-7 join · N file change(s)`，每行都有各自的 token 和费用。展开后可以看到 lead 的拆分和每份子方案；保存的方案文件末尾附有 lead 的拆分和 join 的审查意见（子方案的文件段已在方案正文里，不再重复）。
 
@@ -227,7 +247,7 @@ npm test            # 单元测试：打包、裁剪、bash 拦截、方案解�
 npm run test:e2e    # 端到端：在真实 pi 进程里用脚本化的 mock provider 跑完整流程（不需要 API key）
 ```
 
-端到端测试会验证：Scout 带着只读工具和 handoff 运行；Planner 只收到 1 条消息、没有任何工具；Executor 在全新 session 里应用了修改；方案 .md 文件已保存；Executor session 关联了 parentSession；第二轮对话时上一轮的探索记录被裁掉；Scout 丢弃的结果被替换为提示、discard 调用不进入上下文；Scout 读取的图片作为图片块发给 Planner；Planner 拆分时按 lead + 子 Planner + join 共调用 4 次、系统提示词相同、子方案的文件段和 join 的修改意见被拼进最终方案，各任务的 Executor 只收到自己的文件，并由最后一个 Executor 运行命令；`/mix off` 之后恢复为普通 pi。
+端到端测试会验证：Scout 带着只读工具和 handoff 运行；Planner 只收到 1 条消息、没有任何工具；Executor 在全新 session 里运行；修改由 MixAgent 自动应用，Executor 收到的方案里注明了结果、不再包含已应用的块，SEARCH 已不完全匹配的修改原样交给 Executor；方案 .md 文件已保存；Executor session 关联了 parentSession；第二轮对话时上一轮的探索记录被裁掉；Scout 丢弃的结果被替换为提示、discard 调用不进入上下文；Scout 读取的图片作为图片块发给 Planner；Planner 拆分时按 lead + 子 Planner + join 共调用 4 次、系统提示词相同、子方案的文件段和 join 的修改意见被拼进最终方案，各任务的 Executor 只收到自己的文件，并由最后一个 Executor 运行命令；`/mix off` 之后恢复为普通 pi。
 
 源码结构：
 
@@ -237,6 +257,7 @@ src/
   transcript.ts  提取当前周期、打包成 Markdown、去重、裁剪已完成周期
   planner.ts     调用旗舰模型（streamSimple，无工具），解析 Need context
   executor.ts    用 SDK 创建新 session 运行 Executor
+  apply.ts       自动应用：解析方案里明确的修改，用 pi 的 edit/write 直接应用，并在方案里注明结果
   prompts.ts     三个角色的提示词
   safety.ts      Scout 的 bash 只读拦截
   config.ts      配置加载与合并
