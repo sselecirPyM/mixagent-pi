@@ -26,8 +26,29 @@ writeFileSync(
 		plannerModel: "mock/planner",
 		executorModel: "mock/executor",
 		planDir: join(work, "plans"),
+		usageLog: join(work, "usage.jsonl"),
 	}),
 );
+
+let usageSeen = 0;
+/** Cost records appended to the usage log since the last call. */
+const newCostRecords = () => {
+	const all = readFileSync(join(work, "usage.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+	const fresh = all.slice(usageSeen);
+	usageSeen = all.length;
+	return fresh;
+};
+/** The usage log must account for exactly the model calls the mock provider received (every call costs $0.0002). */
+const assertCostsLogged = (records, calls, what) => {
+	const logged = (role) => records.reduce((n, r) => n + (r.byRole[role]?.calls ?? 0), 0);
+	const made = (model) => calls.filter((c) => c.model === model).length;
+	assert.equal(logged("scout") + logged("main"), made("scout"), `${what}: main-session calls logged`);
+	assert.equal(logged("planner"), made("planner"), `${what}: planner calls logged`);
+	assert.equal(logged("executor"), made("executor"), `${what}: executor calls logged`);
+	const cost = records.reduce((s, r) => s + r.total.cost, 0);
+	assert.ok(Math.abs(cost - calls.length * 0.0002) < 1e-9, `${what}: total cost ${cost} covers every call`);
+	console.log(`${what}: cost log OK (${records.length} record(s), ${calls.length} calls, $${cost.toFixed(4)})`);
+};
 
 const run = spawnSync(
 	process.execPath,
@@ -82,6 +103,11 @@ const headers = sessionFiles.map((f) => JSON.parse(readFileSync(join(sessions, f
 assert.ok(headers.some((h) => h.parentSession), "executor session linked to parent session");
 
 assert.match(run.stdout, /Executor done/, "print mode shows the executor report");
+const printCost = newCostRecords();
+assert.equal(printCost.length, 1, "one cost record per prompt");
+assert.ok(printCost[0].mix && printCost[0].prompt === "Make the greeting friendlier" && printCost[0].sessionFile);
+assert.deepEqual(printCost[0].calls.map((c) => `${c.role}:${c.label}:${c.model}`), ["scout:session:mock/scout", "planner:lead:mock/planner", "executor:executor:mock/executor"]);
+assertCostsLogged(printCost, calls, "print-mode run");
 console.log(`\nprint-mode run OK\n--- final greet.ts ---\n${source}`);
 
 // --- Second run: RPC mode, two prompts in one session -> finished scout cycle is pruned. ---
@@ -125,6 +151,7 @@ const select = await send("/mix model planner", (e) => e.type === "extension_ui_
 const picked = new Promise((resolve) => waiters.push({ match: notify(/MixAgent planner model/), resolve }));
 rpc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: select.id, value: select.options.find((o) => o.startsWith("mock/planner")) })}\n`);
 const pickedNotice = await picked;
+const costNotice = await send("/mix cost", notify(/Last prompt/));
 rpc.kill();
 
 const allRpcCalls = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
@@ -149,6 +176,13 @@ assert.ok(
 	"SEARCH no longer matches exactly (already applied): left to the executor untried, blocks kept",
 );
 console.log(`rpc two-prompt run OK, cycle-2 scout context: [${scouts[2].roles.join(", ")}]`);
+const rpcCost = newCostRecords();
+assert.deepEqual(rpcCost.map((r) => r.mix), [true, true, false], "two mix prompts, then one with mix off");
+assert.ok(rpcCost[2].byRole.main && !rpcCost[2].byRole.scout && !rpcCost[2].byRole.planner, "mix off: calls logged as the main model");
+assertCostsLogged(rpcCost, allRpcCalls, "rpc run");
+assert.match(costNotice.message, /Last prompt \(mix off, [\d.]+s\):\n {2}main .*\[mock\/scout\]/, "/mix cost shows the last prompt");
+assert.match(costNotice.message, /This pi process \(3 prompt\(s\)\):[\s\S]*planner {2}2 call\(s\)/, "/mix cost sums the process");
+console.log(`/mix cost OK: ${JSON.stringify(costNotice.message)}`);
 
 // --- Third run: the scout discards an irrelevant search result. ---
 writeFileSync(log, "");
@@ -169,6 +203,7 @@ assert.ok(!noisyPlanner.firstUser.includes("```\nNOISE_OUTPUT"), "discarded outp
 assert.match(noisyPlanner.firstUser, /echo NOISE_OUTPUT\n\n\[discarded by the scout as irrelevant: noise\]/);
 assert.match(noisyPlanner.firstUser, /grep -rn greet src/);
 console.log("discard run OK");
+assertCostsLogged(newCostRecords(), noisyCalls, "discard run");
 
 // --- Fourth run: an image read by the scout reaches the planner as an image block. ---
 writeFileSync(log, "");
@@ -184,6 +219,7 @@ assert.equal(shotPlanner.messages, 1, "planner still gets a single message");
 assert.equal(shotPlanner.images, 1, "planner sees the image");
 assert.match(shotPlanner.firstUser, /read shot\.png[\s\S]*\[image 1\]/);
 console.log("image run OK");
+assertCostsLogged(newCostRecords(), readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l)), "image run");
 
 // --- Fifth run: lead planner splits -> 2 sub-planners -> join planner, which splits execution into tasks
 // -> parallel executors + one join executor. ---
@@ -217,6 +253,13 @@ assert.ok(forkExec.some((c) => c.firstUser.includes("## Already applied") && c.f
 assert.equal(readFileSync(join(project, "src/T1.txt"), "utf8"), "T1\n", "auto-applied new file ends with a newline");
 assert.equal(readFileSync(join(project, "src/T2.txt"), "utf8"), "T2");
 console.log("fork-join run OK");
+const forkCost = newCostRecords();
+assert.deepEqual(
+	forkCost[0].calls.filter((c) => c.role !== "scout").map((c) => `${c.label}:${c.calls}`).sort(),
+	["S1:1", "S2:1", "T1:1", "T2:2", "commands:2", "join:1", "lead:1"],
+	"fork-join: each planner call and executor logged under its own label",
+);
+assertCostsLogged(forkCost, forkCalls, "fork-join run");
 
 // --- Sixth run: fork-join with failing subtasks. Sub-planner S2 answers empty once and task executor T2 errors
 // once; each is retried and the run completes. ---
@@ -241,5 +284,28 @@ assert.ok(flakyExec.some((c) => c.firstUser.includes("## Already applied")), "jo
 assert.equal(readFileSync(join(project, "src/T1.txt"), "utf8"), "T1\n", "auto-applied new file ends with a newline");
 assert.equal(readFileSync(join(project, "src/T2.txt"), "utf8"), "T2");
 console.log("retry run OK");
+const flakyCost = newCostRecords();
+assert.equal(flakyCost[0].calls.find((c) => c.label === "S2")?.calls, 2, "the failed sub-planner attempt is logged");
+assertCostsLogged(flakyCost, flakyCalls, "retry run");
+
+// --- Seventh run: the same flaky prompt with plannerRetries 0 in the project config. S2 is not retried, so the
+// run stops after the sub-planners without a join planner or executor. ---
+writeFileSync(log, "");
+rmSync(join(project, "src/T1.txt"));
+rmSync(join(project, "src/T2.txt"));
+mkdirSync(join(project, ".pi"), { recursive: true });
+writeFileSync(join(project, ".pi/mixagent.json"), JSON.stringify({ plannerRetries: 0 }));
+const noRetry = spawnSync(
+	process.execPath,
+	[cli, "--no-extensions", "-e", join(here, "mock-provider.ts"), "-e", join(root, "src/index.ts"), "--model", "mock/scout", "--session-dir", sessions, "-p", "fork: flaky: Add two files"],
+	{ cwd: project, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, MOCK_LOG: log }, encoding: "utf8", timeout: 120_000 },
+);
+rmSync(join(project, ".pi"), { recursive: true });
+assert.equal(noRetry.status, 0, `no-retry run failed: ${noRetry.stderr}`);
+const noRetryCalls = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+const noRetryPlanner = noRetryCalls.filter((c) => c.model === "planner");
+assert.equal(noRetryPlanner.length, 3, "lead + 2 sub-planners, no retry of S2 and no join");
+assert.equal(noRetryCalls.filter((c) => c.model === "executor").length, 0, "no executor runs after the sub-planner fails");
+console.log("no-retry run OK");
 
 console.log(`\nE2E OK (${work})`);

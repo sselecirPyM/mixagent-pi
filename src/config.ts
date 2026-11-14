@@ -2,7 +2,7 @@
  * MixAgent configuration.
  *
  * Precedence (highest first):
- *   1. CLI flags (--mix-scout, --mix-planner, --mix-executor, --mix-off)
+ *   1. CLI flags (--mix-scout, --mix-planner, --mix-executor, --mix-off, --mix-usage-log)
  *   2. Runtime overrides via /mix model ...
  *   3. Project config:  <cwd>/.pi/mixagent.json
  *   4. Global config:   ~/.pi/agent/mixagent.json
@@ -64,8 +64,17 @@ export interface MixConfig {
 	maxParallelPlanners: number;
 	/** Max task executors running at the same time in fork-join mode. */
 	maxParallelExecutors: number;
+	/** Extra attempts for a failed sub-planner in fork-join mode; 0 disables retries. */
+	plannerRetries: number;
+	/** Extra attempts (each in a fresh session) for a failed task executor in fork-join mode; 0 disables retries. */
+	executorRetries: number;
 	/** Directory to save plan Markdown files to. Empty string disables saving. "~" is expanded. */
 	planDir: string;
+	/**
+	 * JSONL file to append one cost record per prompt to (every model call: scout or main model, planner, executors).
+	 * Empty string disables it. "~" is expanded; relative paths resolve against the cwd.
+	 */
+	usageLog: string;
 }
 
 export const DEFAULT_CONFIG: MixConfig = {
@@ -91,7 +100,10 @@ export const DEFAULT_CONFIG: MixConfig = {
 	forkJoin: true,
 	maxParallelPlanners: 4,
 	maxParallelExecutors: 4,
+	plannerRetries: 2,
+	executorRetries: 2,
 	planDir: "~/.pi/agent/mixagent/plans",
+	usageLog: "",
 };
 
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];

@@ -19,9 +19,9 @@
  * one compact package and writes only the diff. Models are configurable (see README.md).
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Api, Model } from "@mariozechner/pi-ai";
 import {
 	type ExtensionAPI,
@@ -45,6 +45,7 @@ import {
 	roleKey,
 	type ThinkingLevel,
 } from "./config.ts";
+import { addCall, type CallCost, type CostRecord, formatCost, formatCostLines, formatTokens, summarizeCalls } from "./cost.ts";
 import { type ExecutorProgress, type ExecutorResult, emptyUsage, runExecutor } from "./executor.ts";
 import {
 	assembleJoinPlan,
@@ -85,8 +86,6 @@ const MAX_ATTACHED_FILES = 20;
 /** Raw size limit for image key files (~5 MB once base64-encoded, the common provider limit). */
 const MAX_IMAGE_BYTES = 3_750_000;
 const UPDATE_INTERVAL_MS = 150;
-/** Extra attempts for a failed fork-join subtask (sub-planner or task executor); aborts are not retried. */
-const MAX_TASK_RETRIES = 2;
 /** Tools that only exist during scout runs. */
 const SCOUT_ONLY_TOOLS = [HANDOFF_TOOL, DISCARD_TOOL];
 
@@ -100,6 +99,8 @@ interface SubPlanRun {
 	state: "pending" | "running" | "done";
 	/** 0 for the first attempt, then the retry number. */
 	attempt?: number;
+	/** Max retries allowed (plannerRetries); unset in sessions saved before it was configurable. */
+	retries?: number;
 	text?: string;
 	result?: Pick<PlannerResult, "usage" | "stopReason" | "errorMessage">;
 }
@@ -114,6 +115,8 @@ interface TaskRun {
 	state: "pending" | "running" | "done";
 	/** 0 for the first attempt, then the retry number. */
 	attempt?: number;
+	/** Max retries allowed (executorRetries); unset in sessions saved before it was configurable. */
+	retries?: number;
 	executor?: ExecutorView;
 }
 
@@ -154,6 +157,8 @@ interface HandoffDetails {
 interface SharedState {
 	enabled?: boolean;
 	overrides: Partial<MixConfig>;
+	/** Cost of every prompt in this pi process, for /mix cost. */
+	cost?: { prompts: number; calls: CallCost[]; last?: CostRecord };
 }
 const SHARED_KEY = Symbol.for("pi-mixagent.state");
 const shared: SharedState = ((globalThis as any)[SHARED_KEY] ??= { overrides: {} });
@@ -173,16 +178,6 @@ function shortName(spec: string): string {
 
 function expandHome(p: string): string {
 	return p === "~" || p.startsWith("~/") ? join(homedir(), p.slice(1)) : p;
-}
-
-function formatTokens(n: number): string {
-	if (n < 1000) return `${n}`;
-	if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
-	return `${(n / 1_000_000).toFixed(1)}M`;
-}
-
-function formatCost(cost: number): string {
-	return `$${cost.toFixed(cost < 0.01 ? 4 : 3)}`;
 }
 
 function extractSection(plan: string, heading: string): string | undefined {
@@ -244,16 +239,38 @@ function addExecutorUsage(a: ExecutorProgress["usage"], b: ExecutorProgress["usa
 	};
 }
 
+/** The planner and executor calls of one handoff, for the cost log (the scout's calls are in the main session). */
+function handoffCosts(d: HandoffDetails): CallCost[] {
+	const calls: CallCost[] = [];
+	const planner = (label: string, usage: PlannerResult["usage"] | undefined, attempts = 1) => {
+		if (!usage) return;
+		const { input, output, cacheRead, cacheWrite } = usage;
+		addCall(calls, { role: "planner", label, model: d.plannerModel ?? "", calls: attempts, input, output, cacheRead, cacheWrite, cost: usage.cost.total });
+	};
+	const executor = (label: string, ex: ExecutorView | undefined) => {
+		if (!ex) return;
+		const { input, output, cacheRead, cacheWrite, cost, turns } = ex.usage;
+		addCall(calls, { role: "executor", label, model: d.executorModel ?? "", calls: turns, input, output, cacheRead, cacheWrite, cost });
+	};
+	planner("lead", d.planner?.usage);
+	for (const s of d.subPlans ?? []) planner(s.id, s.result?.usage, s.attempt === undefined ? 0 : s.attempt + 1);
+	planner("join", d.join?.usage);
+	for (const t of d.tasks ?? []) executor(t.id, t.executor);
+	executor(d.tasks ? "commands" : "executor", d.executor);
+	return calls;
+}
+
 /**
- * Runs one fork-join subtask, retrying up to MAX_TASK_RETRIES times while it fails.
+ * Runs one fork-join subtask, retrying up to `retries` times while it fails; aborts are not retried.
  * fn returns the attempt's error (undefined on success) and gets the previous attempt's error on retries.
  */
 async function retryTask(
 	signal: AbortSignal | undefined,
+	retries: number,
 	fn: (attempt: number, lastError: string | undefined) => Promise<string | undefined>,
 ): Promise<void> {
 	let lastError: string | undefined;
-	for (let attempt = 0; attempt <= MAX_TASK_RETRIES; attempt++) {
+	for (let attempt = 0; attempt <= retries; attempt++) {
 		lastError = await fn(attempt, lastError);
 		if (!lastError || signal?.aborted) return;
 	}
@@ -271,6 +288,11 @@ async function runPool<T>(items: T[], limit: number, fn: (item: T, index: number
 	await Promise.all(Array.from({ length: Math.max(1, Math.min(Math.floor(limit) || 1, items.length)) }, worker));
 }
 
+/** A configured retry count as a non-negative integer. */
+function retryCount(n: number): number {
+	return Math.max(0, Math.floor(n) || 0);
+}
+
 export default function mixagent(pi: ExtensionAPI) {
 	let config: MixConfig | undefined;
 	/** Tools that were active before MixAgent took over; restored on /mix off. */
@@ -284,6 +306,7 @@ export default function mixagent(pi: ExtensionAPI) {
 	pi.registerFlag("mix-planner", { description: "MixAgent planner model (provider/id)", type: "string" });
 	pi.registerFlag("mix-executor", { description: "MixAgent executor model (provider/id)", type: "string" });
 	pi.registerFlag("mix-off", { description: "Start with MixAgent disabled", type: "boolean", default: false });
+	pi.registerFlag("mix-usage-log", { description: "Append one JSONL cost record per prompt to this file", type: "string" });
 
 	function effectiveConfig(cwd: string): MixConfig {
 		const cfg: MixConfig = { ...loadConfig(cwd, getAgentDir()), ...shared.overrides };
@@ -291,6 +314,8 @@ export default function mixagent(pi: ExtensionAPI) {
 			const flag = pi.getFlag(`mix-${role}`);
 			if (typeof flag === "string" && flag.trim()) cfg[roleKey(role)] = flag.trim();
 		}
+		const usageLog = pi.getFlag("mix-usage-log");
+		if (typeof usageLog === "string" && usageLog.trim()) cfg.usageLog = usageLog.trim();
 		if (pi.getFlag("mix-off") === true && shared.enabled === undefined) shared.enabled = false;
 		if (shared.enabled !== undefined) cfg.enabled = shared.enabled;
 		return cfg;
@@ -359,6 +384,8 @@ export default function mixagent(pi: ExtensionAPI) {
 
 	/** True while the current agent run is a scout run (set on input, cleared on agent_end). */
 	let scouting = false;
+	/** Model calls of the current prompt (set on input, written on agent_end). */
+	let runCost: { start: number; prompt: string; mix: boolean; calls: CallCost[] } | undefined;
 
 	pi.on("session_start", async (_event, ctx) => {
 		config = effectiveConfig(ctx.cwd);
@@ -376,6 +403,7 @@ export default function mixagent(pi: ExtensionAPI) {
 		config = effectiveConfig(ctx.cwd);
 		scouting = config.enabled && (await enterScout(ctx));
 		if (!scouting) leaveScout();
+		runCost = { start: Date.now(), prompt: event.text, mix: scouting, calls: [] };
 		updateStatus(ctx);
 		return { action: "continue" };
 	});
@@ -385,8 +413,54 @@ export default function mixagent(pi: ExtensionAPI) {
 		return { systemPrompt: `${event.systemPrompt}\n${SCOUT_APPEND}` };
 	});
 
-	pi.on("agent_end", async () => {
+	// Every main-session model call (scout, its print-mode relay, or the plain model when MixAgent is off).
+	pi.on("message_end", async (event) => {
+		const msg = event.message;
+		if (msg.role !== "assistant") return;
+		runCost ??= { start: Date.now(), prompt: "", mix: scouting, calls: [] };
+		const { input, output, cacheRead, cacheWrite, cost } = msg.usage;
+		addCall(runCost.calls, {
+			role: scouting ? "scout" : "main",
+			label: "session",
+			model: `${msg.provider}/${msg.model}`,
+			calls: 1,
+			input,
+			output,
+			cacheRead,
+			cacheWrite,
+			cost: cost.total,
+		});
+	});
+
+	pi.on("agent_end", async (_event, ctx) => {
 		scouting = false;
+		const run = runCost;
+		runCost = undefined;
+		if (!run || run.calls.length === 0) return;
+		const record: CostRecord = {
+			time: new Date().toISOString(),
+			sessionId: ctx.sessionManager.getSessionId(),
+			sessionFile: ctx.sessionManager.getSessionFile(),
+			cwd: ctx.cwd,
+			prompt: run.prompt,
+			mix: run.mix,
+			durationMs: Date.now() - run.start,
+			...summarizeCalls(run.calls),
+			calls: run.calls,
+		};
+		const totals = (shared.cost ??= { prompts: 0, calls: [] });
+		totals.prompts++;
+		for (const c of run.calls) addCall(totals.calls, c);
+		totals.last = record;
+		const usageLog = (config ?? effectiveConfig(ctx.cwd)).usageLog;
+		if (!usageLog) return;
+		const path = resolve(ctx.cwd, expandHome(usageLog));
+		try {
+			await mkdir(dirname(path), { recursive: true });
+			await appendFile(path, `${JSON.stringify(record)}\n`, "utf8");
+		} catch (err) {
+			if (ctx.hasUI) ctx.ui.notify(`MixAgent: cannot write usage log ${path}: ${(err as Error).message}`, "error");
+		}
 	});
 
 	pi.on("tool_call", async (event) => {
@@ -442,6 +516,7 @@ export default function mixagent(pi: ExtensionAPI) {
 			const finish = (text: string, status: HandoffStatus, terminate: boolean) => {
 				details.mixagent = status;
 				details.stage = "done";
+				if (runCost) for (const c of handoffCosts(details)) addCall(runCost.calls, c);
 				return { content: [{ type: "text" as const, text }], details, terminate };
 			};
 			const fail = (message: string) => {
@@ -563,7 +638,8 @@ export default function mixagent(pi: ExtensionAPI) {
 				details.leadPlan = lead;
 				details.plan = undefined;
 				details.stage = "subplanning";
-				const runs: SubPlanRun[] = subtasks.map((s) => ({ ...s, state: "pending" as const }));
+				const plannerRetries = retryCount(cfg.plannerRetries);
+				const runs: SubPlanRun[] = subtasks.map((s) => ({ ...s, state: "pending" as const, retries: plannerRetries }));
 				details.subPlans = runs;
 				pushUpdate();
 				await runPool(subtasks, cfg.maxParallelPlanners, async (s, i) => {
@@ -574,7 +650,7 @@ export default function mixagent(pi: ExtensionAPI) {
 						run.state = "running";
 						// Usage of failed attempts is kept, so the shown tokens and cost cover every attempt.
 						let usage = emptyPlannerUsage();
-						await retryTask(signal, async (attempt) => {
+						await retryTask(signal, plannerRetries, async (attempt) => {
 							run.attempt = attempt;
 							run.text = undefined;
 							pushUpdate();
@@ -703,7 +779,8 @@ export default function mixagent(pi: ExtensionAPI) {
 			// executor in parallel, then one more executor runs the plan's Commands.
 			const split = cfg.forkJoin ? splitPlan(execPlan) : undefined;
 			if (split) {
-				const runs: TaskRun[] = split.tasks.map((t) => ({ id: t.id, goal: t.goal, files: t.files, state: "pending" as const }));
+				const executorRetries = retryCount(cfg.executorRetries);
+				const runs: TaskRun[] = split.tasks.map((t) => ({ id: t.id, goal: t.goal, files: t.files, state: "pending" as const, retries: executorRetries }));
 				details.tasks = runs;
 				pushUpdate();
 				// Each executor only gets its part of the plan; it may read the saved full plan for more context.
@@ -717,7 +794,7 @@ export default function mixagent(pi: ExtensionAPI) {
 						// Usage of failed attempts is kept, so the shown tokens and cost cover every attempt.
 						let prior = emptyUsage();
 						const withPrior = <T extends ExecutorView>(ex: T): T => ({ ...ex, usage: addExecutorUsage(prior, ex.usage) });
-						await retryTask(signal, async (attempt, lastError) => {
+						await retryTask(signal, executorRetries, async (attempt, lastError) => {
 							run.attempt = attempt;
 							run.executor = withPrior(idle());
 							pushUpdate();
@@ -827,8 +904,8 @@ export default function mixagent(pi: ExtensionAPI) {
 			const tokens = (u: PlannerResult["usage"] | undefined) =>
 				u ? ` ${formatTokens(u.input + u.cacheRead + u.cacheWrite)} in / ${formatTokens(u.output)} out · ${formatCost(u.cost.total)}` : "";
 			const planTokens = tokens(d.planner?.usage);
-			const retryLabel = (attempt: number | undefined) =>
-				attempt ? theme.fg("warning", ` (retry ${attempt}/${MAX_TASK_RETRIES})`) : "";
+			const retryLabel = (attempt: number | undefined, retries: number | undefined) =>
+				attempt ? theme.fg("warning", ` (retry ${attempt}${retries !== undefined ? `/${retries}` : ""})`) : "";
 			const planner = shortName(d.plannerModel ?? "planner");
 			const executor = shortName(d.executorModel ?? "executor");
 
@@ -857,7 +934,7 @@ export default function mixagent(pi: ExtensionAPI) {
 				if (expanded && d.leadPlan) container.addChild(new Markdown(d.leadPlan, 0, 0, md));
 				for (const s of d.subPlans) {
 					const goal = theme.fg("muted", `· ${s.goal}`);
-					const retry = retryLabel(s.attempt);
+					const retry = retryLabel(s.attempt, s.retries);
 					if (s.state === "pending") {
 						add(`  ${theme.fg("dim", "·")} ${theme.fg("accent", planner)} ${s.id} waiting ${goal}`);
 					} else if (isPartial && s.state === "running") {
@@ -937,7 +1014,7 @@ export default function mixagent(pi: ExtensionAPI) {
 					add(`${theme.fg("dim", "·")} ${theme.fg("accent", executor)} ${t.id} waiting ${theme.fg("muted", `· ${t.goal}`)}`);
 					continue;
 				}
-				add(`${stateIcon(t.executor, running)} ${theme.fg("accent", executor)} ${t.id} ${running ? "executing…" : "executed"}${retryLabel(t.attempt)}${theme.fg("dim", usageText(t.executor.usage))} ${theme.fg("muted", `· ${t.goal}`)}`);
+				add(`${stateIcon(t.executor, running)} ${theme.fg("accent", executor)} ${t.id} ${running ? "executing…" : "executed"}${retryLabel(t.attempt, t.retries)}${theme.fg("dim", usageText(t.executor.usage))} ${theme.fg("muted", `· ${t.goal}`)}`);
 				if (running || expanded) addCalls(t.executor.toolCalls, expanded ? Infinity : 3);
 				if (expanded && !running && t.executor.output) container.addChild(new Markdown(t.executor.output, 0, 0, md));
 			}
@@ -1005,7 +1082,7 @@ export default function mixagent(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("mix", {
-		description: "MixAgent: /mix [on|off|status|model [<role> [provider/id]]|thinking <role> <level>|save [global|project]]",
+		description: "MixAgent: /mix [on|off|status|cost|model [<role> [provider/id]]|thinking <role> <level>|save [global|project]]",
 		getArgumentCompletions: (prefix) => {
 			const parts = prefix.split(/\s+/);
 			if (parts.length === 3 && parts[0] === "model" && ROLES.includes(parts[1] as Role)) {
@@ -1022,7 +1099,7 @@ export default function mixagent(pi: ExtensionAPI) {
 			}
 			const options =
 				parts.length <= 1
-					? ["on", "off", "status", "model", "thinking", "save"]
+					? ["on", "off", "status", "cost", "model", "thinking", "save"]
 					: parts.length === 2 && (parts[0] === "model" || parts[0] === "thinking")
 						? ROLES
 						: parts.length === 2 && parts[0] === "save"
@@ -1125,6 +1202,23 @@ export default function mixagent(pi: ExtensionAPI) {
 						`  fork-join: ${config.forkJoin ? `on (max ${config.maxParallelPlanners} parallel planners, ${config.maxParallelExecutors} parallel executors)` : "off"}`,
 						`  auto-apply: ${config.autoApply ? "on" : "off"}`,
 						`  config: ${globalConfigPath(getAgentDir())}, ${projectConfigPath(ctx.cwd)}`,
+					];
+					ctx.ui.notify(lines.join("\n"), "info");
+					break;
+				}
+				case "cost": {
+					const cost = shared.cost;
+					if (!cost?.last) {
+						ctx.ui.notify("MixAgent: no model calls recorded in this pi process yet.", "info");
+						return;
+					}
+					const last = cost.last;
+					const lines = [
+						`Last prompt (${last.mix ? "mix" : "mix off"}, ${(last.durationMs / 1000).toFixed(1)}s):`,
+						...formatCostLines(last.calls),
+						`This pi process (${cost.prompts} prompt(s)):`,
+						...formatCostLines(cost.calls),
+						config.usageLog ? `Usage log: ${resolve(ctx.cwd, expandHome(config.usageLog))}` : "Usage log: off (set usageLog or --mix-usage-log)",
 					];
 					ctx.ui.notify(lines.join("\n"), "info");
 					break;

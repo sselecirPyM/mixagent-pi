@@ -69,7 +69,7 @@
 - **join Planner**：所有子方案完成后再调用一次 Planner。它收到包、lead 的拆分和所有子方案，只负责审查，不重写方案：检查接口是否对齐、import 是否缺失、SEARCH 是否有误、同一文件的修改块是否重叠，输出 `## Summary`、`## Revisions`（按文件列出关键修改意见，不写 SEARCH/REPLACE 块或完整代码）、合并后的 `## Commands` 和可选的 `## Tasks`
 - 最终方案由程序拼装：每份子方案的文件段原样保留（按文件归组，标题后标注来自哪个子方案），join 对该文件的修改意见接在后面；只出现在 Revisions 里的文件单独成段。Executor 会被告知这些意见不是精确的修改，优先级高于上面的修改块，需要自己 `read`/`grep` 找到具体位置再改
 - 所有 Planner 调用的系统提示词完全相同，包放在消息开头，角色说明附在末尾，所以子 Planner 和 join 可以命中 lead 写入的提示词缓存（取决于提供商是否支持缓存）
-- 子 Planner 失败（报错、空回复等）时自动重试，最多 2 次；重试后仍失败或被中止时直接报错，不启动 Executor
+- 子 Planner 失败（报错、空回复等）时自动重试，最多 `plannerRetries` 次（默认 2）；重试后仍失败或被中止时直接报错，不启动 Executor
 - 小任务或耦合紧密的任务不拆分：lead 直接写方案，只调用一次 Planner
 
 ### 执行：由 join 决定一个还是多个 Executor
@@ -83,7 +83,7 @@ join Planner 决定怎么执行。改动包含多个独立部分时，它会附�
 ```
 
 - 每组由一个新的 Executor session 执行，只收到方案摘要、`## Changes` 开头的共同说明和自己那几个文件的修改块，最多同时运行 `maxParallelExecutors` 个。方案已保存时（`planDir` 不为空），还会告诉它完整方案的路径：需要其他任务的上下文（例如别的任务定义的名字或签名）时可以 `read`/`grep` 它，但不能修改
-- 任务 Executor 出错时，用新的 session 重试，最多 2 次。重试时会提醒它前一次可能已改了部分文件，修改前先读文件，跳过已完成的修改。中止不重试
+- 任务 Executor 出错时，用新的 session 重试，最多 `executorRetries` 次（默认 2）。重试时会提醒它前一次可能已改了部分文件，修改前先读文件，跳过已完成的修改。中止不重试
 - 所有任务完成后，如果方案有 `## Commands`，再用一个 Executor 统一运行命令（构建、测试），必要时做小修复；有任务失败或被中止时不运行
 - 每个文件只能属于一个任务，所以并行的 Executor 不会改同一个文件。分组不合法（文件没分配、重复分配、任务编号重复、只有一组）时退回到单个 Executor
 - 没有 `## Tasks` 时用单个 Executor
@@ -159,6 +159,7 @@ pi -e /path/to/mixagent/src/index.ts
       --mix-planner anthropic/claude-opus-4-7 \
       --mix-executor openai/gpt-5-mini
    pi --mix-off        # 启动时关闭 MixAgent
+   pi --mix-usage-log runs/usage.jsonl   # 每条提示词追加一行成本记录（见「成本汇总」）
    ```
 2. **运行时命令**（只对当前 pi 进程生效，用 `/mix save` 持久化）
    ```
@@ -195,7 +196,10 @@ pi -e /path/to/mixagent/src/index.ts
 | `forkJoin` | `true` | 允许把大任务拆成子任务，由多次 Planner 调用并行规划、join 合并，再由一个或多个 Executor 执行（见上文 fork-join） |
 | `maxParallelPlanners` | `4` | fork-join 时同时运行的子 Planner 数量上限 |
 | `maxParallelExecutors` | `4` | fork-join 时同时运行的任务 Executor 数量上限 |
+| `plannerRetries` | `2` | fork-join 时子 Planner 失败后最多重试几次；设为 `0` 则不重试 |
+| `executorRetries` | `2` | fork-join 时任务 Executor 失败后最多重试几次（每次用新的 session）；设为 `0` 则不重试 |
 | `planDir` | `~/.pi/agent/mixagent/plans` | 方案 Markdown 的保存目录；设为 `""` 则不保存 |
+| `usageLog` | `""` | 成本记录（JSONL）的路径，每条提示词追加一行；相对路径相对于工作目录；`""` 表示不写（见「成本汇总」） |
 
 ## 命令
 
@@ -207,6 +211,25 @@ pi -e /path/to/mixagent/src/index.ts
 | `/mix model <scout\|planner\|executor> [provider/id]` | 切换某个角色的模型 |
 | `/mix thinking <role> <level>` | 设置某个角色的思考等级 |
 | `/mix save [global\|project]` | 把运行时修改写进配置文件 |
+| `/mix cost` | 按角色汇总上一条提示词和当前 pi 进程的调用次数、token 和费用 |
+
+## 成本汇总
+
+handoff 界面上显示的费用只包括 Planner 和 Executor。要统计一条提示词的全部花费，可以用 `/mix cost`，或者设置 `usageLog`（也可以用 `--mix-usage-log <path>`）。设置后，每条提示词结束时会往这个 JSONL 文件追加一条记录，包含这条提示词的所有模型调用：
+
+- **scout**：主 session 里的每次调用，包括打印模式下最后那次转述
+- **planner**：lead、每个子 Planner（`S1`…，失败重试的调用也算在内）、join；补充上下文（`## Need context`）时每次 handoff 的 lead 调用都会累加
+- **executor**：单个 Executor，或者每个任务（`T1`…，包含重试）加上运行 Commands 的那个（`commands`）
+- **main**：MixAgent 关闭时主 session 用的模型，或者这条提示词跳过了 MixAgent
+
+```json
+{"time":"…","sessionId":"…","sessionFile":"…","cwd":"…","prompt":"…","mix":true,"durationMs":41230,
+ "total":{"calls":9,"input":…,"output":…,"cacheRead":…,"cacheWrite":…,"cost":0.42},
+ "byRole":{"scout":{…},"planner":{…},"executor":{…}},
+ "calls":[{"role":"planner","label":"lead","model":"google/…","calls":1,"input":…,"cost":…}, …]}
+```
+
+`calls` 是模型请求次数（Executor 按轮次计），`input` 不包含缓存的 token（缓存部分分别记在 `cacheRead` / `cacheWrite`），费用按 pi 模型列表里的价格计算。做 A/B 对比时，基线组也加载扩展，但用 `--mix-off` 关闭 MixAgent，这样两组的费用由同一套代码统计；关闭后扩展不会添加任何工具，也不会改提示词。
 
 ## 界面
 
@@ -261,4 +284,5 @@ src/
   prompts.ts     三个角色的提示词
   safety.ts      Scout 的 bash 只读拦截
   config.ts      配置加载与合并
+  cost.ts        成本汇总：按角色累加每次模型调用，格式化 /mix cost 和 usageLog 记录
 ```

@@ -21,5 +21,8 @@
   "forkJoin": true,
   "maxParallelPlanners": 4,
   "maxParallelExecutors": 4,
-  "planDir": "~/.pi/agent/mixagent/plans"
+  "plannerRetries": 2,
+  "executorRetries": 2,
+  "planDir": "~/.pi/agent/mixagent/plans",
+  "usageLog": ""
 }
