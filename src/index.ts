@@ -2,7 +2,7 @@
  * MixAgent — cheap scout, flagship planner, cheap executor.
  *
  *   1. Scout (default Haiku) runs in the main session with read-only tools and explores the code.
- *   2. Scout calls `handoff`: the user request + all scout tool calls/results (+ key files) are packed
+ *   2. Scout calls `handoff`: the user request + all scout tool calls/results are packed
  *      into one Markdown document and sent to the planner (default Opus) in a single tool-less call.
  *      The planner answers with every change as Markdown SEARCH/REPLACE blocks.
  *      For large work the planner may instead split the planning (## Subtasks): each subtask is planned by
@@ -66,7 +66,6 @@ import {
 } from "./prompts.ts";
 import { findWriteReason } from "./safety.ts";
 import {
-	type AttachedFile,
 	applyDiscards,
 	buildPlannerPackage,
 	DISCARD_TOOL,
@@ -74,7 +73,6 @@ import {
 	extractCycle,
 	HANDOFF_TOOL,
 	type HandoffStatus,
-	imageMimeFor,
 	labelCycleSteps,
 	type Msg,
 	pruneFinishedCycles,
@@ -82,9 +80,6 @@ import {
 } from "./transcript.ts";
 
 const ROLES: Role[] = ["scout", "planner", "executor"];
-const MAX_ATTACHED_FILES = 20;
-/** Raw size limit for image key files (~5 MB once base64-encoded, the common provider limit). */
-const MAX_IMAGE_BYTES = 3_750_000;
 const UPDATE_INTERVAL_MS = 150;
 /** Tools that only exist during scout runs. */
 const SCOUT_ONLY_TOOLS = [HANDOFF_TOOL, DISCARD_TOOL];
@@ -502,11 +497,6 @@ export default function mixagent(pi: ExtensionAPI) {
 				description:
 					"Concise findings for the planner: relevant locations, how the code works, constraints, and any needed context from earlier in the conversation.",
 			}),
-			files: Type.Optional(
-				Type.Array(Type.String(), {
-					description: "Paths (relative to cwd) of files the planner must see in full, typically the files to change.",
-				}),
-			),
 		}),
 		executionMode: "sequential",
 
@@ -535,34 +525,16 @@ export default function mixagent(pi: ExtensionAPI) {
 			details.plannerModel = modelSpec(planner);
 			details.executorModel = modelSpec(executor);
 
-			// 1. Pack request + scout tool calls + key files.
+			// 1. Pack request + scout tool calls.
 			const messages = ctx.sessionManager
 				.getBranch()
 				.flatMap((e) => (e.type === "message" ? [e.message as unknown as Msg] : []));
 			const cycle = extractCycle(messages);
-			const files: AttachedFile[] = await Promise.all(
-				(params.files ?? []).slice(0, MAX_ATTACHED_FILES).map(async (p): Promise<AttachedFile> => {
-					const path = p.replace(/^@/, "");
-					try {
-						const mimeType = imageMimeFor(path);
-						if (mimeType) {
-							const data = await readFile(resolve(ctx.cwd, path));
-							if (data.length > MAX_IMAGE_BYTES) return { path, error: "image too large to attach; read it instead (read resizes images)" };
-							return { path, image: { type: "image", data: data.toString("base64"), mimeType } };
-						}
-						return { path, content: await readFile(resolve(ctx.cwd, path), "utf8") };
-					} catch (err) {
-						return { path, error: (err as NodeJS.ErrnoException).code ?? (err as Error).message };
-					}
-				}),
-			);
 			const pkg = buildPlannerPackage({
 				cycle,
 				notes: params.notes ?? "",
-				files,
 				cwd: ctx.cwd,
 				maxToolOutputChars: cfg.maxToolOutputChars,
-				maxFileChars: cfg.maxFileChars,
 				maxPackageChars: cfg.maxPackageChars,
 				maxImages: planner.input.includes("image") ? cfg.maxPlannerImages : 0,
 			});
@@ -869,8 +841,7 @@ export default function mixagent(pi: ExtensionAPI) {
 
 		renderCall(args, theme, context) {
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			const files = args.files?.length ? theme.fg("dim", ` · ${args.files.length} file(s)`) : "";
-			text.setText(`${theme.fg("toolTitle", theme.bold("handoff"))} ${theme.fg("muted", "scout → planner → executor")}${files}`);
+			text.setText(`${theme.fg("toolTitle", theme.bold("handoff"))} ${theme.fg("muted", "scout → planner → executor")}`);
 			return text;
 		},
 

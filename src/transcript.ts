@@ -5,8 +5,6 @@
  * Pure functions over message arrays so they can be unit tested without pi.
  */
 
-import { isAbsolute, resolve } from "node:path";
-
 export const HANDOFF_TOOL = "handoff";
 export const DISCARD_TOOL = "discard";
 
@@ -237,45 +235,12 @@ export function extractCycle(messages: Msg[]): ScoutCycle {
 	return cycle;
 }
 
-function normalizePath(cwd: string, p: string): string {
-	const stripped = p.replace(/^@/, "");
-	return (isAbsolute(stripped) ? stripped : resolve(cwd, stripped)).replace(/\\/g, "/").toLowerCase();
-}
-
-/** A 1-based, inclusive range of lines. */
-export interface LineRange {
-	first: number;
-	last: number;
-}
-
-/** Lines a `read` step returned. Never too few: the notice pi appends to the output can add a couple of lines. */
-function readLines(step: ScoutStep): LineRange {
-	const offset = Number(step.args.offset);
-	const limit = Number(step.args.limit);
-	const first = offset > 1 ? Math.floor(offset) : 1;
-	const count = Math.min(step.output.split("\n").length, limit > 0 ? limit : Infinity);
-	return { first, last: first + count - 1 };
-}
-
-/**
- * Removes redundant steps: identical repeated calls (keep the latest) and reads of files
- * that are attached in full anyway. `cut` is the line range truncation dropped from an attached file.
- */
-export function dedupeSteps(steps: ScoutStep[], cwd: string, attachedFiles: { path: string; cut?: LineRange }[]): ScoutStep[] {
-	const attached = new Map(attachedFiles.map((f) => [normalizePath(cwd, f.path), f.cut]));
+/** Removes identical repeated calls, keeping the latest. */
+export function dedupeSteps(steps: ScoutStep[]): ScoutStep[] {
 	const seen = new Set<string>();
 	const kept: ScoutStep[] = [];
 	for (let i = steps.length - 1; i >= 0; i--) {
 		const step = steps[i];
-		if (step.toolName === "read" && typeof step.args.path === "string" && !step.isError) {
-			const path = normalizePath(cwd, step.args.path);
-			if (attached.has(path)) {
-				// A read that reaches into the lines cut from a truncated file is the package's only copy of them.
-				const cut = attached.get(path);
-				const read = readLines(step);
-				if (!cut || read.last < cut.first || read.first > cut.last) continue;
-			}
-		}
 		const key = `${step.toolName}\u0000${JSON.stringify(step.args)}`;
 		if (seen.has(key)) continue;
 		seen.add(key);
@@ -293,15 +258,6 @@ export function truncateMiddle(text: string, max: number): string {
 	const tail = max - head;
 	const omitted = text.length - head - tail;
 	return `${text.slice(0, head)}\n… [${omitted} chars omitted] …\n${text.slice(text.length - tail)}`;
-}
-
-/** Lines that truncateMiddle(text, max) drops in whole or in part; undefined when nothing is dropped. */
-function truncatedLines(text: string, max: number): LineRange | undefined {
-	if (text.length <= max) return undefined;
-	const head = keptHead(max);
-	const tailStart = text.length - (max - head);
-	const lineAt = (index: number) => text.slice(0, index).split("\n").length;
-	return { first: lineAt(head), last: lineAt(tailStart - 1) };
 }
 
 export function describeCall(toolName: string, args: Record<string, any>): string {
@@ -338,74 +294,11 @@ function fenced(text: string, lang = ""): string {
 	return `${fence}${lang}\n${text.replace(/\n$/, "")}\n${fence}`;
 }
 
-const EXT_LANG: Record<string, string> = {
-	ts: "ts",
-	tsx: "tsx",
-	js: "js",
-	jsx: "jsx",
-	mjs: "js",
-	cjs: "js",
-	py: "python",
-	rs: "rust",
-	go: "go",
-	java: "java",
-	kt: "kotlin",
-	cs: "csharp",
-	cpp: "cpp",
-	cc: "cpp",
-	c: "c",
-	h: "c",
-	hpp: "cpp",
-	rb: "ruby",
-	php: "php",
-	swift: "swift",
-	sh: "bash",
-	json: "json",
-	yaml: "yaml",
-	yml: "yaml",
-	toml: "toml",
-	md: "markdown",
-	html: "html",
-	css: "css",
-	scss: "scss",
-	sql: "sql",
-	vue: "vue",
-	svelte: "svelte",
-};
-
-export function langFor(path: string): string {
-	const ext = path.split(".").pop()?.toLowerCase() ?? "";
-	return EXT_LANG[ext] ?? "";
-}
-
-const IMAGE_MIME: Record<string, string> = {
-	png: "image/png",
-	jpg: "image/jpeg",
-	jpeg: "image/jpeg",
-	gif: "image/gif",
-	webp: "image/webp",
-};
-
-/** MIME type of image files the planner can be shown, by extension. */
-export function imageMimeFor(path: string): string | undefined {
-	return IMAGE_MIME[path.split(".").pop()?.toLowerCase() ?? ""];
-}
-
-export interface AttachedFile {
-	path: string;
-	content?: string;
-	/** Set instead of `content` for image files. */
-	image?: ImageBlock;
-	error?: string;
-}
-
 export interface PackageInput {
 	cycle: ScoutCycle;
 	notes: string;
-	files: AttachedFile[];
 	cwd: string;
 	maxToolOutputChars: number;
-	maxFileChars: number;
 	maxPackageChars: number;
 	/** Max images attached to the package; 0 when the planner model cannot see images. */
 	maxImages: number;
@@ -425,7 +318,7 @@ export interface PlannerPackage {
 
 /** Builds the Markdown document (plus the images it references) sent to the planner. */
 export function buildPlannerPackage(input: PackageInput): PlannerPackage {
-	const { cycle, notes, files, cwd } = input;
+	const { cycle, notes, cwd } = input;
 	const parts: string[] = [];
 	const images: PackageImage[] = [];
 	const attach = (list: ImageBlock[], label: string): string =>
@@ -455,13 +348,7 @@ export function buildPlannerPackage(input: PackageInput): PlannerPackage {
 		);
 	}
 
-	const steps = dedupeSteps(
-		cycle.steps,
-		cwd,
-		files
-			.filter((f) => f.content !== undefined || f.image)
-			.map((f) => ({ path: f.path, cut: f.content === undefined ? undefined : truncatedLines(f.content, input.maxFileChars) })),
-	);
+	const steps = dedupeSteps(cycle.steps);
 	if (steps.length > 0) {
 		const rendered = steps.map((step, i) => {
 			if (step.discarded !== undefined) {
@@ -477,15 +364,6 @@ export function buildPlannerPackage(input: PackageInput): PlannerPackage {
 			}${fenced(output)}${stepImages}`;
 		});
 		parts.push(`# Scout tool calls\n\n${rendered.join("\n\n")}`);
-	}
-
-	if (files.length > 0) {
-		const rendered = files.map((f) => {
-			if (f.image) return `## \`${f.path}\`\n\n${attach([f.image], `key file ${f.path}`)}`;
-			if (f.content === undefined) return `## \`${f.path}\`\n\n(unavailable: ${f.error ?? "unknown error"})`;
-			return `## \`${f.path}\`\n\n${fenced(truncateMiddle(f.content, input.maxFileChars), langFor(f.path))}`;
-		});
-		parts.push(`# Key files (current full content)\n\n${rendered.join("\n\n")}`);
 	}
 
 	return { text: truncateMiddle(parts.join("\n\n"), input.maxPackageChars), images };

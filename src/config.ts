@@ -38,11 +38,9 @@ export interface MixConfig {
 	scoutBashGuard: boolean;
 	/** Per tool-output character cap inside the planner package. */
 	maxToolOutputChars: number;
-	/** Per attached-file character cap inside the planner package. */
-	maxFileChars: number;
 	/** Total character cap for the planner package. */
 	maxPackageChars: number;
-	/** Max images (user attachments, image reads, image key files) sent to the planner; 0 disables. */
+	/** Max images (user attachments, image reads) sent to the planner; 0 disables. */
 	maxPlannerImages: number;
 	/** How many times the planner may send the scout back for more context per request. */
 	maxContextRounds: number;
@@ -90,7 +88,6 @@ export const DEFAULT_CONFIG: MixConfig = {
 	executorTools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
 	scoutBashGuard: true,
 	maxToolOutputChars: 20_000,
-	maxFileChars: 60_000,
 	maxPackageChars: 500_000,
 	maxPlannerImages: 10,
 	maxContextRounds: 3,
